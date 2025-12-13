@@ -143,8 +143,91 @@ case "$CMD" in
         echo "Launched $SESSION"
         ;;
 
+    split|s)
+        if [ -z "$1" ]; then
+            echo "Usage: shuttle split <brief-id>"
+            exit 1
+        fi
+
+        if [ -z "$TMUX" ]; then
+            echo "Error: split requires being inside a tmux session"
+            echo "Use 'shuttle go <brief>' to launch in a new window instead"
+            exit 1
+        fi
+
+        BRIEF_ID="$1"
+        echo "Opening split pane for $BRIEF_ID..."
+
+        # Create horizontal split running claude
+        tmux split-window -h -c ~/projects/speakbot "claude"
+
+        # Wait for claude prompt
+        for i in {1..30}; do
+            if tmux capture-pane -p | tail -5 | grep -qE ">|You:"; then
+                break
+            fi
+            sleep 1
+        done
+
+        # Send the HANDOFF
+        tmux send-keys "HANDOFF: $BRIEF_ID" Enter
+        echo "Split opened. Use 'shuttle unsplit' to close."
+        ;;
+
+    vsplit|vs)
+        if [ -z "$1" ]; then
+            echo "Usage: shuttle vsplit <brief-id>"
+            exit 1
+        fi
+
+        if [ -z "$TMUX" ]; then
+            echo "Error: vsplit requires being inside a tmux session"
+            echo "Use 'shuttle go <brief>' to launch in a new window instead"
+            exit 1
+        fi
+
+        BRIEF_ID="$1"
+        echo "Opening vertical split pane for $BRIEF_ID..."
+
+        # Create vertical split running claude
+        tmux split-window -v -c ~/projects/speakbot "claude"
+
+        # Wait for claude prompt
+        for i in {1..30}; do
+            if tmux capture-pane -p | tail -5 | grep -qE ">|You:"; then
+                break
+            fi
+            sleep 1
+        done
+
+        # Send the HANDOFF
+        tmux send-keys "HANDOFF: $BRIEF_ID" Enter
+        echo "Split opened. Use 'shuttle unsplit' to close."
+        ;;
+
+    unsplit)
+        if [ -z "$TMUX" ]; then
+            echo "Error: unsplit requires being inside a tmux session"
+            exit 1
+        fi
+
+        PANE_COUNT=$(tmux list-panes | wc -l)
+        if [ "$PANE_COUNT" -eq 1 ]; then
+            echo "No split pane to close"
+            exit 0
+        fi
+
+        # Kill the other pane (not the current one)
+        CURRENT_PANE=$(tmux display-message -p '#{pane_index}')
+        if [ "$CURRENT_PANE" -eq 0 ]; then
+            tmux kill-pane -t 1
+        else
+            tmux kill-pane -t 0
+        fi
+        echo "Split closed."
+        ;;
+
     ground)
-        echo "Grounding all shuttle sessions..."
         tmux ls 2>/dev/null | grep "^shuttle-" | cut -d: -f1 | while read -r sess; do
             echo "  Killing $sess"
             tmux kill-session -t "$sess"
@@ -163,11 +246,15 @@ Commands:
   board, b <n>    Board session by number or name
   kill, k <n>     Kill session by number or name
   go, g <brief>   Launch new session on a brief
+  split, s <brief>   Open brief in horizontal split pane
+  vsplit, vs <brief> Open brief in vertical split pane
+  unsplit         Close split pane
   ground          Kill all shuttle sessions
 
 Examples:
   shuttle                     # show status
   shuttle go brief-20251210-ceor
+  shuttle split brief-20251210-ceor  # side-by-side pairing
   shuttle board 1             # board first session
   shuttle kill diverge        # kill session matching 'diverge'
 EOF
