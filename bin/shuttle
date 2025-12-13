@@ -71,7 +71,7 @@ case "$CMD" in
         fi
 
         echo "Boarding $SESSION..."
-        gnome-terminal -- tmux attach -t "$SESSION"
+        dbus-launch gnome-terminal -- tmux attach -t "$SESSION" 2>/dev/null
         ;;
 
     kill|k)
@@ -115,7 +115,7 @@ case "$CMD" in
         # Check if session already exists - reboard instead of creating new
         if tmux has-session -t "$SESSION" 2>/dev/null; then
             echo "Session '$SESSION' exists - reboarding..."
-            gnome-terminal -- tmux attach -t "$SESSION"
+            dbus-launch gnome-terminal -- tmux attach -t "$SESSION" 2>/dev/null
             exit 0
         fi
 
@@ -138,8 +138,8 @@ case "$CMD" in
         tmux send-keys -t "$SESSION" "HANDOFF: $BRIEF_ID"
         tmux send-keys -t "$SESSION" Enter
 
-        # Open terminal
-        gnome-terminal -- tmux attach -t "$SESSION"
+        # Open terminal (dbus-launch needed when called from within tmux)
+        dbus-launch gnome-terminal -- tmux attach -t "$SESSION" 2>/dev/null
         echo "Launched $SESSION"
         ;;
 
