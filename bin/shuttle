@@ -1,0 +1,181 @@
+#!/bin/bash
+# shuttle - CLI for managing Claude Code agent sessions
+# Usage: shuttle [command] [args]
+
+set -e
+
+CMD="${1:-status}"
+shift 2>/dev/null || true
+
+case "$CMD" in
+    status)
+        echo "SESSIONS:"
+        SESSIONS=$(tmux ls 2>/dev/null || true)
+        if [ -z "$SESSIONS" ]; then
+            echo "  (none)"
+        else
+            i=1
+            while IFS= read -r line; do
+                NAME=$(echo "$line" | cut -d: -f1)
+                ATTACHED=$(echo "$line" | grep -q "attached" && echo "attached" || echo "detached")
+                CREATED=$(echo "$line" | grep -oP 'created [^)]+' | sed 's/created //')
+                echo "  [$i] $NAME  ($ATTACHED)  $CREATED"
+                ((i++))
+            done <<< "$SESSIONS"
+        fi
+        echo ""
+
+        echo "READY BRIEFS:"
+        skein folios ledger --type brief --status open 2>/dev/null | grep "brief-" | head -5 | while read -r line; do
+            echo "  $line"
+        done
+        echo ""
+
+        echo "SHARDS:"
+        TRIAGE=$(skein shard triage 2>/dev/null | tail -n +3 || true)
+        if [ -z "$TRIAGE" ]; then
+            echo "  (unavailable)"
+        else
+            READY=$(echo "$TRIAGE" | grep -c "✓" 2>/dev/null || true)
+            CONFLICT=$(echo "$TRIAGE" | grep -c "⚠" 2>/dev/null || true)
+            EMPTY=$(echo "$TRIAGE" | grep -c "empty" 2>/dev/null || true)
+            echo "  ${READY:-0} ready, ${CONFLICT:-0} conflicts, ${EMPTY:-0} empty"
+        fi
+        ;;
+
+    ls|list)
+        tmux ls 2>/dev/null | nl -w2 -s'] ' | sed 's/^/[/' || echo "(no sessions)"
+        ;;
+
+    briefs)
+        SITE="${1:-ledger}"
+        echo "Open briefs in $SITE:"
+        skein folios "$SITE" --type brief --status open 2>/dev/null | grep -E "brief-|^$" || echo "(none)"
+        ;;
+
+    board|b)
+        if [ -z "$1" ]; then
+            echo "Usage: shuttle board <number|name>"
+            exit 1
+        fi
+
+        if [[ "$1" =~ ^[0-9]+$ ]]; then
+            SESSION=$(tmux ls 2>/dev/null | sed -n "${1}p" | cut -d: -f1)
+        else
+            SESSION=$(tmux ls 2>/dev/null | grep "$1" | head -1 | cut -d: -f1)
+        fi
+
+        if [ -z "$SESSION" ]; then
+            echo "Session not found: $1"
+            exit 1
+        fi
+
+        echo "Boarding $SESSION..."
+        gnome-terminal -- tmux attach -t "$SESSION"
+        ;;
+
+    kill|k)
+        if [ -z "$1" ]; then
+            echo "Usage: shuttle kill <number|name>"
+            exit 1
+        fi
+
+        if [[ "$1" =~ ^[0-9]+$ ]]; then
+            SESSION=$(tmux ls 2>/dev/null | sed -n "${1}p" | cut -d: -f1)
+        else
+            SESSION=$(tmux ls 2>/dev/null | grep "$1" | head -1 | cut -d: -f1)
+        fi
+
+        if [ -z "$SESSION" ]; then
+            echo "Session not found: $1"
+            exit 1
+        fi
+
+        echo "Killing $SESSION..."
+        tmux kill-session -t "$SESSION"
+        echo "Done."
+        ;;
+
+    go|g)
+        if [ -z "$1" ]; then
+            echo "Usage: shuttle go <brief-id>"
+            exit 1
+        fi
+        BRIEF_ID="$1"
+
+        # Get brief title for human-readable session name
+        BRIEF_TITLE=$(skein folio "$BRIEF_ID" 2>/dev/null | grep "^    #" | head -1 | sed 's/^[[:space:]]*#[[:space:]]*//' | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g' | sed 's/--*/-/g' | cut -c1-25)
+
+        if [ -z "$BRIEF_TITLE" ]; then
+            SESSION="shuttle-${BRIEF_ID}"
+        else
+            SESSION="shuttle-${BRIEF_TITLE}"
+        fi
+
+        # Check if session already exists - reboard instead of creating new
+        if tmux has-session -t "$SESSION" 2>/dev/null; then
+            echo "Session '$SESSION' exists - reboarding..."
+            gnome-terminal -- tmux attach -t "$SESSION"
+            exit 0
+        fi
+
+        echo "Launching: $SESSION"
+
+        # Create new tmux session running claude
+        tmux new-session -d -s "$SESSION" -c ~/projects/speakbot "claude"
+
+        # Wait for claude prompt to appear
+        echo "Waiting for Claude..."
+        for i in {1..30}; do
+            if tmux capture-pane -t "$SESSION" -p | tail -5 | grep -qE ">|You:"; then
+                echo "Ready!"
+                break
+            fi
+            sleep 1
+        done
+
+        # Send the HANDOFF message
+        tmux send-keys -t "$SESSION" "HANDOFF: $BRIEF_ID"
+        tmux send-keys -t "$SESSION" Enter
+
+        # Open terminal
+        gnome-terminal -- tmux attach -t "$SESSION"
+        echo "Launched $SESSION"
+        ;;
+
+    ground)
+        echo "Grounding all shuttle sessions..."
+        tmux ls 2>/dev/null | grep "^shuttle-" | cut -d: -f1 | while read -r sess; do
+            echo "  Killing $sess"
+            tmux kill-session -t "$sess"
+        done
+        echo "Done."
+        ;;
+
+    help|--help|-h)
+        cat << 'EOF'
+shuttle - Manage Claude Code agent sessions
+
+Commands:
+  status          Show sessions, briefs, and shards (default)
+  ls              List active sessions
+  briefs [site]   Show open briefs (default: ledger)
+  board, b <n>    Board session by number or name
+  kill, k <n>     Kill session by number or name
+  go, g <brief>   Launch new session on a brief
+  ground          Kill all shuttle sessions
+
+Examples:
+  shuttle                     # show status
+  shuttle go brief-20251210-ceor
+  shuttle board 1             # board first session
+  shuttle kill diverge        # kill session matching 'diverge'
+EOF
+        ;;
+
+    *)
+        echo "Unknown command: $CMD"
+        echo "Run 'shuttle help' for usage"
+        exit 1
+        ;;
+esac
