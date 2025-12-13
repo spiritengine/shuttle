@@ -185,7 +185,8 @@ case "$CMD" in
         done
 
         # Send the HANDOFF message
-        tmux send-keys -t "$SESSION" "HANDOFF: $BRIEF_ID" C-m
+        tmux send-keys -t "$SESSION" "HANDOFF: $BRIEF_ID"
+        tmux send-keys -t "$SESSION" Enter
 
         # Open terminal (dbus-launch needed when called from within tmux)
         dbus-launch gnome-terminal -- tmux attach -t "$SESSION" 2>/dev/null
@@ -234,7 +235,8 @@ case "$CMD" in
         done
 
         # Send the HANDOFF to the specific pane we created
-        tmux send-keys -t "$NEW_PANE" "HANDOFF: $BRIEF_ID" C-m
+        tmux send-keys -t "$NEW_PANE" "HANDOFF: $BRIEF_ID"
+        tmux send-keys -t "$NEW_PANE" Enter
         echo "Split opened. Use 'shuttle unsplit' to close."
         ;;
 
