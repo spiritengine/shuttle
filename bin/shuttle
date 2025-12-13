@@ -4,6 +4,51 @@
 
 set -e
 
+# Parse --dir and --project options, resolve to PROJECT_DIR
+# Sets: PROJECT_DIR, remaining args in POSITIONAL array
+parse_project_opts() {
+    PROJECT_DIR=""
+    PROJECT_NAME=""
+    POSITIONAL=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -d|--dir)
+                PROJECT_DIR="$2"
+                shift 2
+                ;;
+            -p|--project)
+                PROJECT_NAME="$2"
+                shift 2
+                ;;
+            *)
+                POSITIONAL+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    # Error if both set
+    if [ -n "$PROJECT_DIR" ] && [ -n "$PROJECT_NAME" ]; then
+        echo "Error: cannot use both --dir and --project"
+        exit 1
+    fi
+
+    # Resolve project name to path
+    if [ -n "$PROJECT_NAME" ]; then
+        PROJECT_DIR="$HOME/projects/$PROJECT_NAME"
+        if [ ! -d "$PROJECT_DIR" ]; then
+            echo "Error: project not found: $PROJECT_DIR"
+            exit 1
+        fi
+    fi
+
+    # Default to current directory
+    if [ -z "$PROJECT_DIR" ]; then
+        PROJECT_DIR="$(pwd)"
+    fi
+}
+
 CMD="${1:-status}"
 shift 2>/dev/null || true
 
@@ -97,8 +142,11 @@ case "$CMD" in
         ;;
 
     go|g)
+        parse_project_opts "$@"
+        set -- "${POSITIONAL[@]}"
+
         if [ -z "$1" ]; then
-            echo "Usage: shuttle go <brief-id>"
+            echo "Usage: shuttle go [--dir PATH | --project NAME] <brief-id>"
             exit 1
         fi
         BRIEF_ID="$1"
@@ -119,89 +167,74 @@ case "$CMD" in
             exit 0
         fi
 
-        echo "Launching: $SESSION"
+        echo "Launching: $SESSION (in $PROJECT_DIR)"
 
         # Create new tmux session running claude
-        tmux new-session -d -s "$SESSION" -c ~/projects/speakbot "claude"
+        tmux new-session -d -s "$SESSION" -c "$PROJECT_DIR" "claude"
 
         # Wait for claude prompt to appear
         echo "Waiting for Claude..."
-        for i in {1..30}; do
-            if tmux capture-pane -t "$SESSION" -p | tail -5 | grep -qE ">|You:"; then
+        for i in {1..60}; do
+            CAPTURED=$(tmux capture-pane -t "$SESSION" -p)
+            # Look for Claude's prompt or shortcuts hint
+            if echo "$CAPTURED" | grep -qE "^>|? for"; then
                 echo "Ready!"
                 break
             fi
-            sleep 1
+            sleep 0.2
         done
 
         # Send the HANDOFF message
-        tmux send-keys -t "$SESSION" "HANDOFF: $BRIEF_ID"
-        tmux send-keys -t "$SESSION" Enter
+        tmux send-keys -t "$SESSION" "HANDOFF: $BRIEF_ID" C-m
 
         # Open terminal (dbus-launch needed when called from within tmux)
         dbus-launch gnome-terminal -- tmux attach -t "$SESSION" 2>/dev/null
         echo "Launched $SESSION"
         ;;
 
-    split|s)
+    split|s|vsplit|vs)
+        # Determine split direction
+        if [[ "$CMD" == "vsplit" || "$CMD" == "vs" ]]; then
+            SPLIT_FLAG="-v"
+            SPLIT_TYPE="vertical"
+        else
+            SPLIT_FLAG="-h"
+            SPLIT_TYPE="horizontal"
+        fi
+
+        parse_project_opts "$@"
+        set -- "${POSITIONAL[@]}"
+
         if [ -z "$1" ]; then
-            echo "Usage: shuttle split <brief-id>"
+            echo "Usage: shuttle $CMD [--dir PATH | --project NAME] <brief-id>"
             exit 1
         fi
 
         if [ -z "$TMUX" ]; then
-            echo "Error: split requires being inside a tmux session"
+            echo "Error: $CMD requires being inside a tmux session"
             echo "Use 'shuttle go <brief>' to launch in a new window instead"
             exit 1
         fi
 
         BRIEF_ID="$1"
-        echo "Opening split pane for $BRIEF_ID..."
+        echo "Opening $SPLIT_TYPE split for $BRIEF_ID (in $PROJECT_DIR)..."
 
-        # Create horizontal split running claude
-        tmux split-window -h -c ~/projects/speakbot "claude"
+        # Create split running claude, capture the new pane ID
+        NEW_PANE=$(tmux split-window $SPLIT_FLAG -c "$PROJECT_DIR" -P -F '#{pane_id}' "claude")
 
-        # Wait for claude prompt
-        for i in {1..30}; do
-            if tmux capture-pane -p | tail -5 | grep -qE ">|You:"; then
+        # Wait for claude prompt in the NEW pane
+        echo "Waiting for Claude..."
+        for i in {1..60}; do
+            CAPTURED=$(tmux capture-pane -t "$NEW_PANE" -p)
+            # Look for Claude's prompt or shortcuts hint
+            if echo "$CAPTURED" | grep -qE "^>|? for"; then
                 break
             fi
-            sleep 1
+            sleep 0.2
         done
 
-        # Send the HANDOFF
-        tmux send-keys "HANDOFF: $BRIEF_ID" Enter
-        echo "Split opened. Use 'shuttle unsplit' to close."
-        ;;
-
-    vsplit|vs)
-        if [ -z "$1" ]; then
-            echo "Usage: shuttle vsplit <brief-id>"
-            exit 1
-        fi
-
-        if [ -z "$TMUX" ]; then
-            echo "Error: vsplit requires being inside a tmux session"
-            echo "Use 'shuttle go <brief>' to launch in a new window instead"
-            exit 1
-        fi
-
-        BRIEF_ID="$1"
-        echo "Opening vertical split pane for $BRIEF_ID..."
-
-        # Create vertical split running claude
-        tmux split-window -v -c ~/projects/speakbot "claude"
-
-        # Wait for claude prompt
-        for i in {1..30}; do
-            if tmux capture-pane -p | tail -5 | grep -qE ">|You:"; then
-                break
-            fi
-            sleep 1
-        done
-
-        # Send the HANDOFF
-        tmux send-keys "HANDOFF: $BRIEF_ID" Enter
+        # Send the HANDOFF to the specific pane we created
+        tmux send-keys -t "$NEW_PANE" "HANDOFF: $BRIEF_ID" C-m
         echo "Split opened. Use 'shuttle unsplit' to close."
         ;;
 
@@ -251,9 +284,15 @@ Commands:
   unsplit         Close split pane
   ground          Kill all shuttle sessions
 
+Options (for go, split, vsplit):
+  -d, --dir PATH      Run in specified directory
+  -p, --project NAME  Run in ~/projects/NAME
+  (default: current directory)
+
 Examples:
   shuttle                     # show status
   shuttle go brief-20251210-ceor
+  shuttle go -p skein brief-20251210-ceor  # launch in skein project
   shuttle split brief-20251210-ceor  # side-by-side pairing
   shuttle board 1             # board first session
   shuttle kill diverge        # kill session matching 'diverge'
