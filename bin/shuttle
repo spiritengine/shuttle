@@ -4,11 +4,12 @@
 
 set -e
 
-# Parse --dir and --project options, resolve to PROJECT_DIR
-# Sets: PROJECT_DIR, remaining args in POSITIONAL array
+# Parse --dir, --project, and --headless options
+# Sets: PROJECT_DIR, HEADLESS, remaining args in POSITIONAL array
 parse_project_opts() {
     PROJECT_DIR=""
     PROJECT_NAME=""
+    HEADLESS=""
     POSITIONAL=()
 
     while [[ $# -gt 0 ]]; do
@@ -20,6 +21,10 @@ parse_project_opts() {
             -p|--project)
                 PROJECT_NAME="$2"
                 shift 2
+                ;;
+            --headless)
+                HEADLESS=1
+                shift
                 ;;
             *)
                 POSITIONAL+=("$1")
@@ -46,6 +51,11 @@ parse_project_opts() {
     # Default to current directory
     if [ -z "$PROJECT_DIR" ]; then
         PROJECT_DIR="$(pwd)"
+    fi
+
+    # Headless: explicit flag, env var, or no display
+    if [ -n "$SHUTTLE_HEADLESS" ] || [ -z "$DISPLAY" ]; then
+        HEADLESS=1
     fi
 }
 
@@ -99,24 +109,43 @@ case "$CMD" in
         ;;
 
     board|b)
-        if [ -z "$1" ]; then
-            echo "Usage: shuttle board <number|name>"
+        # Check for --headless flag
+        HEADLESS=""
+        TARGET=""
+        for arg in "$@"; do
+            if [ "$arg" = "--headless" ]; then
+                HEADLESS=1
+            else
+                TARGET="$arg"
+            fi
+        done
+        # Also check env var and display
+        if [ -n "$SHUTTLE_HEADLESS" ] || [ -z "$DISPLAY" ]; then
+            HEADLESS=1
+        fi
+
+        if [ -z "$TARGET" ]; then
+            echo "Usage: shuttle board [--headless] <number|name>"
             exit 1
         fi
 
-        if [[ "$1" =~ ^[0-9]+$ ]]; then
-            SESSION=$(tmux ls 2>/dev/null | sed -n "${1}p" | cut -d: -f1)
+        if [[ "$TARGET" =~ ^[0-9]+$ ]]; then
+            SESSION=$(tmux ls 2>/dev/null | sed -n "${TARGET}p" | cut -d: -f1)
         else
-            SESSION=$(tmux ls 2>/dev/null | grep "$1" | head -1 | cut -d: -f1)
+            SESSION=$(tmux ls 2>/dev/null | grep "$TARGET" | head -1 | cut -d: -f1)
         fi
 
         if [ -z "$SESSION" ]; then
-            echo "Session not found: $1"
+            echo "Session not found: $TARGET"
             exit 1
         fi
 
         echo "Boarding $SESSION..."
-        dbus-launch gnome-terminal -- tmux attach -t "$SESSION" 2>/dev/null
+        if [ -n "$HEADLESS" ]; then
+            tmux attach -t "$SESSION"
+        else
+            dbus-launch gnome-terminal -- tmux attach -t "$SESSION" 2>/dev/null
+        fi
         ;;
 
     kill|k)
@@ -163,7 +192,11 @@ case "$CMD" in
         # Check if session already exists - reboard instead of creating new
         if tmux has-session -t "$SESSION" 2>/dev/null; then
             echo "Session '$SESSION' exists - reboarding..."
-            dbus-launch gnome-terminal -- tmux attach -t "$SESSION" 2>/dev/null
+            if [ -n "$HEADLESS" ]; then
+                echo "Attach with: tmux attach -t $SESSION"
+            else
+                dbus-launch gnome-terminal -- tmux attach -t "$SESSION" 2>/dev/null
+            fi
             exit 0
         fi
 
@@ -188,9 +221,14 @@ case "$CMD" in
         tmux send-keys -t "$SESSION" "HANDOFF: $BRIEF_ID"
         tmux send-keys -t "$SESSION" Enter
 
-        # Open terminal (dbus-launch needed when called from within tmux)
-        dbus-launch gnome-terminal -- tmux attach -t "$SESSION" 2>/dev/null
-        echo "Launched $SESSION"
+        # Open terminal or print attach instructions
+        if [ -n "$HEADLESS" ]; then
+            echo "Session ready: $SESSION"
+            echo "Attach with: tmux attach -t $SESSION"
+        else
+            dbus-launch gnome-terminal -- tmux attach -t "$SESSION" 2>/dev/null
+            echo "Launched $SESSION"
+        fi
         ;;
 
     split|s|vsplit|vs)
@@ -286,15 +324,20 @@ Commands:
   unsplit         Close split pane
   ground          Kill all shuttle sessions
 
-Options (for go, split, vsplit):
-  -d, --dir PATH      Run in specified directory
-  -p, --project NAME  Run in ~/projects/NAME
-  (default: current directory)
+Options (for go, board, split, vsplit):
+  -d, --dir PATH      Run in specified directory (go, split, vsplit)
+  -p, --project NAME  Run in ~/projects/NAME (go, split, vsplit)
+  --headless          Don't open GUI terminal (go, board)
+  (default: current directory, auto-headless if no $DISPLAY)
+
+Environment:
+  SHUTTLE_HEADLESS=1  Force headless mode
 
 Examples:
   shuttle                     # show status
   shuttle go brief-20251210-ceor
   shuttle go -p skein brief-20251210-ceor  # launch in skein project
+  shuttle go --headless brief-id  # create session without opening terminal
   shuttle split brief-20251210-ceor  # side-by-side pairing
   shuttle board 1             # board first session
   shuttle kill diverge        # kill session matching 'diverge'

@@ -17,6 +17,30 @@ shuttle ground       # kill all shuttle sessions
 shuttle briefs       # show open briefs
 ```
 
+## Project Directory Options
+
+For `go`, `split`, and `vsplit`:
+
+```bash
+shuttle go -p skein brief-20251210-ceor  # launch in ~/projects/skein
+shuttle go -d /path/to/project brief-id  # launch in specified directory
+shuttle split -p spindle brief-id        # split in spindle project
+```
+
+Default: current working directory.
+
+## Headless Mode
+
+For SSH/server use without a display:
+
+```bash
+shuttle go --headless brief-id  # create session, print attach command
+shuttle board --headless 1      # attach in current terminal
+SHUTTLE_HEADLESS=1 shuttle go brief-id  # env var override
+```
+
+Auto-detects: if `$DISPLAY` is unset, headless mode is automatic.
+
 ## For Agents
 
 You can use shuttle to launch pairing sessions for humans:
