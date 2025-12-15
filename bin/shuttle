@@ -214,6 +214,25 @@ case "$CMD" in
         tmux send-keys -t "$SESSION" Enter
         ;;
 
+    peek|p)
+        TARGET="${1:-1}"
+        LINES="${2:-20}"
+
+        if [[ "$TARGET" =~ ^[0-9]+$ ]]; then
+            SESSION=$(tmux ls 2>/dev/null | sed -n "${TARGET}p" | cut -d: -f1)
+        else
+            SESSION=$(tmux ls 2>/dev/null | grep "$TARGET" | head -1 | cut -d: -f1)
+        fi
+
+        if [ -z "$SESSION" ]; then
+            echo "Session not found: $TARGET"
+            exit 1
+        fi
+
+        echo "=== $SESSION (last $LINES lines) ==="
+        tmux capture-pane -t "$SESSION" -p | tail -n "$LINES"
+        ;;
+
     go|g)
         parse_project_opts "$@"
         set -- "${POSITIONAL[@]}"
@@ -362,6 +381,7 @@ Commands:
   briefs [site]   Show open briefs (default: ledger)
   board, b <n>    Board session by number or name
   kill, k <n>     Kill session by number or name
+  peek, p <n> [lines]  Show last lines from session (default: 20)
   send <n> <msg>  Send message to session
   go, g <brief>   Launch new session on a brief
   split, s <brief>   Open brief in horizontal split pane
@@ -385,6 +405,8 @@ Examples:
   shuttle go --headless brief-id  # create session without opening terminal
   shuttle split brief-20251210-ceor  # side-by-side pairing
   shuttle board 1             # board first session
+  shuttle peek 1              # see what session 1 is doing
+  shuttle peek 2 50           # last 50 lines from session 2
   shuttle send 1 "check the failing tests"  # nudge a session
   shuttle send 2 "skein torch"  # trigger retirement
   shuttle kill diverge        # kill session matching 'diverge'
