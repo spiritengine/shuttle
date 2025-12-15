@@ -64,6 +64,17 @@ shift 2>/dev/null || true
 
 case "$CMD" in
     status)
+        # Start slow skein calls in parallel
+        BRIEFS_TMP=$(mktemp)
+        SHARDS_TMP=$(mktemp)
+        trap "rm -f $BRIEFS_TMP $SHARDS_TMP" EXIT
+
+        (skein folios ledger --type brief --status open 2>/dev/null | grep "brief-" | head -5 > "$BRIEFS_TMP") &
+        BRIEFS_PID=$!
+        (skein shard triage 2>/dev/null | tail -n +3 > "$SHARDS_TMP") &
+        SHARDS_PID=$!
+
+        # Sessions (fast, do synchronously)
         echo "SESSIONS:"
         SESSIONS=$(tmux ls 2>/dev/null || true)
         if [ -z "$SESSIONS" ]; then
@@ -80,14 +91,22 @@ case "$CMD" in
         fi
         echo ""
 
+        # Wait for briefs and display
+        wait $BRIEFS_PID 2>/dev/null
         echo "READY BRIEFS:"
-        skein folios ledger --type brief --status open 2>/dev/null | grep "brief-" | head -5 | while read -r line; do
-            echo "  $line"
-        done
+        if [ -s "$BRIEFS_TMP" ]; then
+            while read -r line; do
+                echo "  $line"
+            done < "$BRIEFS_TMP"
+        else
+            echo "  (none)"
+        fi
         echo ""
 
+        # Wait for shards and display
+        wait $SHARDS_PID 2>/dev/null
         echo "SHARDS:"
-        TRIAGE=$(skein shard triage 2>/dev/null | tail -n +3 || true)
+        TRIAGE=$(cat "$SHARDS_TMP")
         if [ -z "$TRIAGE" ]; then
             echo "  (unavailable)"
         else
