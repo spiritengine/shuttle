@@ -11,6 +11,7 @@ shuttle split <brief>   # open brief in horizontal split pane
 shuttle vsplit <brief>  # open brief in vertical split pane
 shuttle unsplit         # close split pane
 shuttle board <n>    # attach to session
+shuttle send <n> <msg>  # send message to session
 shuttle ls           # list sessions
 shuttle kill <n>     # kill session
 shuttle ground       # kill all shuttle sessions
@@ -40,6 +41,18 @@ SHUTTLE_HEADLESS=1 shuttle go brief-id  # env var override
 ```
 
 Auto-detects: if `$DISPLAY` is unset, headless mode is automatic.
+
+## Sending Messages to Sessions
+
+Send text to a running session's Claude prompt:
+
+```bash
+shuttle send 1 "check the failing tests"
+shuttle send 2 "skein torch"  # trigger retirement
+shuttle send myproject "look at src/auth.py"
+```
+
+Useful for nudging agents, giving directions, or triggering retirement.
 
 ## For Agents
 
