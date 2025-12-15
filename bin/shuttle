@@ -189,6 +189,31 @@ case "$CMD" in
         echo "Done."
         ;;
 
+    send)
+        if [ -z "$1" ] || [ -z "$2" ]; then
+            echo "Usage: shuttle send <number|name> <message>"
+            exit 1
+        fi
+
+        TARGET="$1"
+        MESSAGE="$2"
+
+        if [[ "$TARGET" =~ ^[0-9]+$ ]]; then
+            SESSION=$(tmux ls 2>/dev/null | sed -n "${TARGET}p" | cut -d: -f1)
+        else
+            SESSION=$(tmux ls 2>/dev/null | grep "$TARGET" | head -1 | cut -d: -f1)
+        fi
+
+        if [ -z "$SESSION" ]; then
+            echo "Session not found: $TARGET"
+            exit 1
+        fi
+
+        echo "Sending to $SESSION: $MESSAGE"
+        tmux send-keys -t "$SESSION" "$MESSAGE"
+        tmux send-keys -t "$SESSION" Enter
+        ;;
+
     go|g)
         parse_project_opts "$@"
         set -- "${POSITIONAL[@]}"
@@ -337,6 +362,7 @@ Commands:
   briefs [site]   Show open briefs (default: ledger)
   board, b <n>    Board session by number or name
   kill, k <n>     Kill session by number or name
+  send <n> <msg>  Send message to session
   go, g <brief>   Launch new session on a brief
   split, s <brief>   Open brief in horizontal split pane
   vsplit, vs <brief> Open brief in vertical split pane
@@ -359,6 +385,8 @@ Examples:
   shuttle go --headless brief-id  # create session without opening terminal
   shuttle split brief-20251210-ceor  # side-by-side pairing
   shuttle board 1             # board first session
+  shuttle send 1 "check the failing tests"  # nudge a session
+  shuttle send 2 "skein torch"  # trigger retirement
   shuttle kill diverge        # kill session matching 'diverge'
 EOF
         ;;
