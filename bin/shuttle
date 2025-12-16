@@ -59,6 +59,18 @@ parse_project_opts() {
     fi
 }
 
+# Send a message to a tmux pane and press Enter
+# Usage: tmux_send_cmd <target> <message>
+# NOTE: Must use two separate send-keys calls when using -t target!
+# Single-line "message" Enter doesn't work reliably with -t flag.
+tmux_send_cmd() {
+    local target="$1"
+    local message="$2"
+    tmux send-keys -t "$target" "$message"
+    sleep 0.1
+    tmux send-keys -t "$target" Enter
+}
+
 CMD="${1:-status}"
 shift 2>/dev/null || true
 
@@ -210,8 +222,7 @@ case "$CMD" in
         fi
 
         echo "Sending to $SESSION: $MESSAGE"
-        tmux send-keys -t "$SESSION" "$MESSAGE"
-        tmux send-keys -t "$SESSION" Enter
+        tmux_send_cmd "$SESSION" "$MESSAGE"
         ;;
 
     peek|p)
@@ -281,8 +292,7 @@ case "$CMD" in
         done
 
         # Send the HANDOFF message
-        tmux send-keys -t "$SESSION" "HANDOFF: $BRIEF_ID"
-        tmux send-keys -t "$SESSION" Enter
+        tmux_send_cmd "$SESSION" "HANDOFF: $BRIEF_ID"
 
         # Open terminal or print attach instructions
         if [ -n "$HEADLESS" ]; then
@@ -336,8 +346,7 @@ case "$CMD" in
         done
 
         # Send the HANDOFF to the specific pane we created
-        tmux send-keys -t "$NEW_PANE" "HANDOFF: $BRIEF_ID"
-        tmux send-keys -t "$NEW_PANE" Enter
+        tmux_send_cmd "$NEW_PANE" "HANDOFF: $BRIEF_ID"
         echo "Split opened. Use 'shuttle unsplit' to close."
         ;;
 
