@@ -15,7 +15,7 @@ _shuttle() {
     local cur prev words cword
     _init_completion || return
 
-    local commands="status watch ls list briefs board b kill k peek p send go g split s vsplit vs unsplit ground help"
+    local commands="status watch ls list board b kill k peek p send go g split s vsplit vs unsplit ground help"
 
     # If completing first argument (the command)
     if [[ $cword -eq 1 ]]; then
@@ -70,11 +70,6 @@ _shuttle() {
                 # Complete brief IDs
                 COMPREPLY=($(compgen -W "$(_shuttle_briefs)" -- "$cur"))
             fi
-            ;;
-
-        briefs)
-            # Complete site names - common ones
-            COMPREPLY=($(compgen -W "ledger shuttle" -- "$cur"))
             ;;
 
         status|watch|ls|list|unsplit|ground|help)

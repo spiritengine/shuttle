@@ -133,12 +133,6 @@ case "$CMD" in
         tmux ls 2>/dev/null | nl -w2 -s'] ' | sed 's/^/[/' || echo "(no sessions)"
         ;;
 
-    briefs)
-        SITE="${1:-ledger}"
-        echo "Open briefs in $SITE:"
-        skein folios "$SITE" --type brief --status open 2>/dev/null | grep -E "brief-|^$" || echo "(none)"
-        ;;
-
     board|b)
         # Check for --headless flag
         HEADLESS=""
@@ -396,7 +390,6 @@ Commands:
   status          Show sessions, briefs, and shards (default)
   watch, w        Continuous status refresh (Ctrl-C to exit)
   ls              List active sessions
-  briefs [site]   Show open briefs (default: ledger)
   board, b <n>    Board session by number or name
   kill, k <n>     Kill session by number or name
   peek, p <n> [lines]  Show last lines from session (default: 20)
