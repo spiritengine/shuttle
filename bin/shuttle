@@ -363,6 +363,14 @@ case "$CMD" in
         echo "Split closed."
         ;;
 
+    watch|w)
+        while true; do
+            clear
+            "$0" status
+            sleep 2
+        done
+        ;;
+
     ground)
         tmux ls 2>/dev/null | grep "^shuttle-" | cut -d: -f1 | while read -r sess; do
             echo "  Killing $sess"
@@ -377,6 +385,7 @@ shuttle - Manage Claude Code agent sessions
 
 Commands:
   status          Show sessions, briefs, and shards (default)
+  watch, w        Continuous status refresh (Ctrl-C to exit)
   ls              List active sessions
   briefs [site]   Show open briefs (default: ledger)
   board, b <n>    Board session by number or name

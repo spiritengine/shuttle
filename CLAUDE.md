@@ -6,6 +6,7 @@ CLI for launching and managing Claude Code pairing sessions.
 
 ```bash
 shuttle              # status: sessions, briefs, shards
+shuttle watch        # continuous status refresh (Ctrl-C to exit)
 shuttle go <brief>   # launch session on brief (new window)
 shuttle split <brief>   # open brief in horizontal split pane
 shuttle vsplit <brief>  # open brief in vertical split pane
