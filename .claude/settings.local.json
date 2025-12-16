@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./bin/shuttle)",
+      "Bash(./bin/shuttle split:*)",
+      "Bash(tmux list-panes:*)",
+      "Bash(tmux capture-pane:*)",
+      "Bash(./bin/shuttle unsplit:*)",
+      "Bash(./bin/shuttle go:*)",
+      "Bash(./bin/shuttle peek:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$(cat <<''EOF''\nAdd peek command to view session output\n\nshuttle peek <n> [lines] - show last N lines from a session\nwithout boarding. Defaults to 20 lines. Useful for quick\nvisibility into what an agent is doing.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n)\")",
+      "mcp__spindle__spin",
+      "mcp__spindle__spool_dashboard",
+      "mcp__spindle__spool_peek",
+      "mcp__spindle__unspool",
+      "Bash(./bin/shuttle:*)",
+      "Bash(SKEIN_AGENT_ID=prime skein close:*)",
+      "Bash(tmux list-sessions:*)",
+      "Bash(tmux display-message:*)"
+    ]
+  },
+  "outputStyle": "Explanatory",
+  "spinnerTipsEnabled": false
+}

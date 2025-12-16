@@ -381,6 +381,85 @@ case "$CMD" in
         done
         ;;
 
+    search)
+        if [ -z "$1" ]; then
+            echo "Usage: shuttle search <query> [--all]"
+            echo "  --all  Search all projects (default: current directory's project)"
+            exit 1
+        fi
+
+        QUERY="$1"
+        SEARCH_ALL=""
+        if [ "$2" = "--all" ] || [ "$1" = "--all" ]; then
+            SEARCH_ALL=1
+            if [ "$1" = "--all" ]; then
+                QUERY="$2"
+            fi
+        fi
+
+        CC_PROJECTS="$HOME/.claude/projects"
+
+        if [ -n "$SEARCH_ALL" ]; then
+            SEARCH_DIRS="$CC_PROJECTS"
+        else
+            # Current project only
+            PROJECT_PATH=$(pwd | sed 's|^/||; s|/|-|g; s|^|-|')
+            if [ ! -d "$CC_PROJECTS/$PROJECT_PATH" ]; then
+                echo "No CC history for current directory"
+                echo "Use --all to search all projects"
+                exit 1
+            fi
+            SEARCH_DIRS="$CC_PROJECTS/$PROJECT_PATH"
+        fi
+
+        echo "Searching for: $QUERY"
+        echo ""
+
+        # Search through session files, extract matching text
+        find "$SEARCH_DIRS" -name "*.jsonl" -type f 2>/dev/null | xargs grep -l "$QUERY" 2>/dev/null | while read -r FILE; do
+            # Get project name from path
+            PROJECT=$(basename "$(dirname "$FILE")" | sed 's/^-//; s/-/\//g')
+            SESSION_ID=$(basename "$FILE" .jsonl)
+
+            # Skip agent files
+            if [[ "$SESSION_ID" == agent-* ]]; then
+                continue
+            fi
+
+            # Get file modification time
+            MOD_TIME=$(stat -c %Y "$FILE" 2>/dev/null)
+            NOW=$(date +%s)
+            AGE=$(( (NOW - MOD_TIME) / 86400 ))
+            if [ "$AGE" -eq 0 ]; then
+                AGE_STR="today"
+            elif [ "$AGE" -eq 1 ]; then
+                AGE_STR="yesterday"
+            else
+                AGE_STR="${AGE}d ago"
+            fi
+
+            echo "=== $SESSION_ID ($AGE_STR) ==="
+            echo "    project: $PROJECT"
+
+            # Show matching lines with context (text content only)
+            grep "$QUERY" "$FILE" 2>/dev/null | head -3 | while read -r line; do
+                # Extract text content
+                TEXT=$(echo "$line" | jq -r '
+                    .message.content |
+                    if type == "string" then .
+                    elif type == "array" then
+                        [.[] | select(.type == "text") | .text] | join(" ")
+                    else ""
+                    end
+                ' 2>/dev/null | head -c 200)
+                if [ -n "$TEXT" ] && [ "$TEXT" != "null" ]; then
+                    echo "    ...$TEXT..."
+                fi
+            done
+            echo ""
+        done
+        ;;
+
     peek|p)
         TARGET="${1:-1}"
         LINES="${2:-20}"
@@ -556,6 +635,7 @@ Commands:
   kill, k <n>     Kill session by number or name
   peek, p <n> [lines]  Show last lines from session (default: 20)
   context, ctx <n> [msgs]  Show conversation context (default: 10 messages)
+  search <query>  Search CC session history (--all for all projects)
   send <n> <msg>  Send message to session
   relay <n> <file>  Send file contents to session (use '-' for stdin)
   go, g <brief>   Launch new session on a brief
