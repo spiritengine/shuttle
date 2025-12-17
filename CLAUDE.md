@@ -5,7 +5,7 @@ CLI for launching and managing Claude Code pairing sessions.
 ## Commands
 
 ```bash
-shuttle              # status: sessions, briefs, shards
+shuttle              # status with state indicators (⚡🔒💤⚠️)
 shuttle watch        # continuous status refresh (Ctrl-C to exit)
 shuttle go <brief>   # launch session on brief (new window)
 shuttle split <brief>   # open brief in horizontal split pane
@@ -20,6 +20,15 @@ shuttle ls           # list sessions
 shuttle kill <n>     # kill session
 shuttle ground       # kill all shuttle sessions
 ```
+
+## Session State Indicators
+
+Status shows each session's state:
+- ⚡ working  - Claude is actively processing
+- 🔒 approval - Waiting for user to approve an action
+- 💤 waiting  - At prompt, waiting for input
+- ⚠️ stuck    - Idle >5min with unclear state
+- ○ unknown  - Cannot determine state
 
 ## Project Directory Options
 

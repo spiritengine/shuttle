@@ -85,6 +85,59 @@ format_age() {
     fi
 }
 
+# Detect Claude Code session state from pane content
+detect_session_state() {
+    local session="$1"
+    local idle_seconds="$2"
+
+    # Capture last 30 lines from the pane
+    local content
+    content=$(tmux capture-pane -t "$session" -p 2>/dev/null | tail -30)
+
+    if [ -z "$content" ]; then
+        echo "unknown"
+        return
+    fi
+
+    # Check for approval prompt (highest priority - needs human action)
+    if echo "$content" | grep -qE "Do you want to proceed\?|❯ 1\. Yes|Allow once|Allow always"; then
+        echo "approval"
+        return
+    fi
+
+    # Check for actively working indicators
+    if echo "$content" | grep -qE "\(esc to interrupt|Running…|✶ [A-Z].*…|✻ [A-Z].*…|\* [A-Z].*…"; then
+        echo "working"
+        return
+    fi
+
+    # Check for waiting at prompt
+    if echo "$content" | tail -5 | grep -qE "^>"; then
+        echo "waiting"
+        return
+    fi
+
+    # Check for stuck (idle for more than 5 minutes with no clear state)
+    if [ "$idle_seconds" -gt 300 ]; then
+        echo "stuck"
+        return
+    fi
+
+    echo "unknown"
+}
+
+# Format state with symbol
+format_state() {
+    local state="$1"
+    case "$state" in
+        working)  echo "⚡" ;;
+        approval) echo "🔒" ;;
+        waiting)  echo "💤" ;;
+        stuck)    echo "⚠️ " ;;
+        *)        echo "○" ;;
+    esac
+}
+
 CMD="${1:-status}"
 shift 2>/dev/null || true
 
@@ -116,12 +169,9 @@ case "$CMD" in
                 else
                     ATTACH_STR="detached"
                 fi
-                # Activity indicator: ● if active in last 30s, ○ otherwise
-                if [ "$IDLE" -lt 30 ]; then
-                    INDICATOR="●"
-                else
-                    INDICATOR="○"
-                fi
+                # Detect session state from pane content
+                STATE=$(detect_session_state "$NAME" "$IDLE")
+                INDICATOR=$(format_state "$STATE")
                 printf "  [%d] %-30s (%s)  %4s %s\n" "$i" "$NAME" "$ATTACH_STR" "$AGE" "$INDICATOR"
                 ((i++))
             done <<< "$SESSIONS"
