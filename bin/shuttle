@@ -510,6 +510,59 @@ case "$CMD" in
         done
         ;;
 
+    resume)
+        if [ -z "$1" ]; then
+            echo "Usage: shuttle resume <session-id>"
+            echo "  Resume a CC session by UUID (from shuttle search)"
+            exit 1
+        fi
+
+        SESSION_ID="$1"
+        CC_PROJECTS="$HOME/.claude/projects"
+
+        # Find which project contains this session
+        SESSION_FILE=$(find "$CC_PROJECTS" -name "${SESSION_ID}.jsonl" -type f 2>/dev/null | head -1)
+
+        if [ -z "$SESSION_FILE" ]; then
+            echo "Session not found: $SESSION_ID"
+            echo "Use 'shuttle search' to find valid session IDs"
+            exit 1
+        fi
+
+        # Extract project path from encoded folder name
+        # ~/.claude/projects/-home-patrick-projects-foo/uuid.jsonl → /home/patrick/projects/foo
+        ENCODED_PATH=$(basename "$(dirname "$SESSION_FILE")")
+        PROJECT_DIR=$(echo "$ENCODED_PATH" | sed 's/^-//; s/-/\//g')
+        PROJECT_DIR="/$PROJECT_DIR"
+
+        if [ ! -d "$PROJECT_DIR" ]; then
+            echo "Project directory not found: $PROJECT_DIR"
+            exit 1
+        fi
+
+        # Create session name from project
+        PROJECT_NAME=$(basename "$PROJECT_DIR")
+        TMUX_SESSION="resume-${PROJECT_NAME}-${SESSION_ID:0:8}"
+
+        echo "Resuming session $SESSION_ID"
+        echo "  Project: $PROJECT_DIR"
+        echo "  Tmux: $TMUX_SESSION"
+
+        # Launch CC with --resume in new tmux session
+        tmux new-session -d -s "$TMUX_SESSION" -c "$PROJECT_DIR" "claude --resume $SESSION_ID"
+
+        # Wait for claude to start
+        sleep 1
+
+        # Open terminal or print attach instructions
+        if [ -n "$HEADLESS" ] || [ -n "$SHUTTLE_HEADLESS" ] || [ -z "$DISPLAY" ]; then
+            echo "Attach with: tmux attach -t $TMUX_SESSION"
+        else
+            dbus-launch gnome-terminal -- tmux attach -t "$TMUX_SESSION" 2>/dev/null
+            echo "Launched $TMUX_SESSION"
+        fi
+        ;;
+
     peek|p)
         TARGET="${1:-1}"
         LINES="${2:-20}"
@@ -686,6 +739,7 @@ Commands:
   peek, p <n> [lines]  Show last lines from session (default: 20)
   context, ctx <n> [msgs]  Show conversation context (default: 10 messages)
   search <query>  Search CC session history (--all for all projects)
+  resume <id>   Resume a past CC session by UUID
   send <n> <msg>  Send message to session
   relay <n> <file>  Send file contents to session (use '-' for stdin)
   go, g <brief>   Launch new session on a brief
