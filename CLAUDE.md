@@ -17,7 +17,11 @@ shuttle tail <n>     # live output stream (Ctrl-C to exit)
 shuttle send <n> <msg>  # send message to session
 shuttle relay <n> <file>  # send file contents to session
 shuttle context <n>  # show conversation context from CC history
-shuttle search <q>   # search CC session history (--all for all projects)
+shuttle index        # build session index for fast search
+shuttle index -u     # incremental update (fast, ~8s)
+shuttle search -l -a # list all sessions from index
+shuttle search <q>   # search content (uses index)
+shuttle search -l -s 7  # list sessions from last 7 days
 shuttle resume <id>  # resume past session by UUID (from search)
 shuttle export <n|id>  # export session to markdown or JSON
 shuttle ls           # list sessions
@@ -107,9 +111,32 @@ Precedence: CLI flags > Environment variables > Config file > Defaults
 
 Run `shuttle config` to see current settings.
 
+## Session Index
+
+Shuttle maintains an index of all CC sessions for fast search. The index stores:
+- Session UUID, project path, file location
+- Started/last activity timestamps
+- Message count and first user message (summary)
+
+```bash
+shuttle index             # full rebuild (~3 min for 1000+ sessions)
+shuttle index --update    # incremental update (~8s)
+```
+
+Index location: `~/.shuttle/index.json`
+
+Search uses the index for filtering, then greps matching files:
+
+```bash
+shuttle search "auth" --all        # content search across all projects
+shuttle search --list --since 7    # list sessions from last 7 days
+shuttle search -l -p speakbot      # list sessions for speakbot project
+```
+
 ## Architecture
 
 - Single bash script at `bin/shuttle`
 - Uses tmux for session management
 - Uses configurable terminal emulator (default: gnome-terminal)
 - Integrates with SKEIN for briefs and shards
+- Session index in `~/.shuttle/index.json` for fast search

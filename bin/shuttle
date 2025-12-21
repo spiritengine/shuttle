@@ -500,82 +500,161 @@ case "$CMD" in
         ;;
 
     search)
-        if [ -z "$1" ]; then
-            echo "Usage: shuttle search <query> [--all]"
-            echo "  --all  Search all projects (default: current directory's project)"
+        SHUTTLE_INDEX_FILE="$HOME/.shuttle/index.json"
+        CC_PROJECTS="$HOME/.claude/projects"
+
+        # Parse options
+        QUERY=""
+        SEARCH_ALL=""
+        LIST_MODE=""
+        SINCE_FILTER=""
+        PROJECT_FILTER=""
+        LIMIT=20
+
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --all|-a)
+                    SEARCH_ALL=1
+                    shift
+                    ;;
+                --list|-l)
+                    LIST_MODE=1
+                    shift
+                    ;;
+                --since|-s)
+                    SINCE_FILTER="$2"
+                    shift 2
+                    ;;
+                --project|-p)
+                    PROJECT_FILTER="$2"
+                    shift 2
+                    ;;
+                --limit|-n)
+                    LIMIT="$2"
+                    shift 2
+                    ;;
+                -*)
+                    echo "Unknown option: $1"
+                    echo "Usage: shuttle search [query] [options]"
+                    echo "  --all, -a        Search all projects (default: current project)"
+                    echo "  --list, -l       List sessions from index (no content search)"
+                    echo "  --since, -s N    Only sessions from last N days"
+                    echo "  --project, -p P  Filter by project path (substring match)"
+                    echo "  --limit, -n N    Limit results (default: 20)"
+                    exit 1
+                    ;;
+                *)
+                    QUERY="$1"
+                    shift
+                    ;;
+            esac
+        done
+
+        # Check if index exists
+        if [ ! -f "$SHUTTLE_INDEX_FILE" ]; then
+            echo "No index found. Run 'shuttle index' first."
             exit 1
         fi
 
-        QUERY="$1"
-        SEARCH_ALL=""
-        if [ "$2" = "--all" ] || [ "$1" = "--all" ]; then
-            SEARCH_ALL=1
-            if [ "$1" = "--all" ]; then
-                QUERY="$2"
-            fi
+        # Build jq filter for index queries
+        JQ_FILTER='.sessions | to_entries[]'
+
+        # Project filter
+        if [ -n "$PROJECT_FILTER" ]; then
+            JQ_FILTER="$JQ_FILTER | select(.value.project | contains(\"$PROJECT_FILTER\"))"
+        elif [ -z "$SEARCH_ALL" ]; then
+            # Default: current project
+            CURRENT_PROJECT=$(pwd)
+            JQ_FILTER="$JQ_FILTER | select(.value.project | startswith(\"$CURRENT_PROJECT\"))"
         fi
 
-        CC_PROJECTS="$HOME/.claude/projects"
+        # Date filter
+        if [ -n "$SINCE_FILTER" ]; then
+            SINCE_EPOCH=$(($(date +%s) - (SINCE_FILTER * 86400)))
+            JQ_FILTER="$JQ_FILTER | select(.value.mtime >= $SINCE_EPOCH)"
+        fi
 
-        if [ -n "$SEARCH_ALL" ]; then
-            SEARCH_DIRS="$CC_PROJECTS"
+        # Sort by last activity (most recent first)
+        JQ_FILTER="[$JQ_FILTER] | sort_by(.value.mtime) | reverse"
+
+        # Limit results
+        JQ_FILTER="$JQ_FILTER | .[:$LIMIT]"
+
+        if [ -n "$LIST_MODE" ]; then
+            # List mode: show sessions from index without content search
+            echo "Sessions from index:"
+            echo ""
+            # Use tab delimiter for safe parsing
+            jq -r "$JQ_FILTER | .[] | \"\(.key)\t\(.value.mtime)\t\(.value.project)\t\(.value.summary[0:50] | gsub(\"[\\n\\t]\"; \" \"))\"" "$SHUTTLE_INDEX_FILE" 2>/dev/null | while IFS=$'\t' read -r ID MTIME PROJECT SUMMARY; do
+                NOW=$(date +%s)
+                AGE=$(( (NOW - MTIME) / 86400 ))
+                if [ "$AGE" -eq 0 ]; then
+                    AGE_STR="today"
+                elif [ "$AGE" -eq 1 ]; then
+                    AGE_STR="1d ago"
+                else
+                    AGE_STR="${AGE}d ago"
+                fi
+                # Extract just project name
+                PROJ_NAME=$(basename "$PROJECT")
+                printf "%-38s %-10s %-15s %s\n" "$ID" "$AGE_STR" "$PROJ_NAME" "$SUMMARY"
+            done
         else
-            # Current project only
-            PROJECT_PATH=$(pwd | sed 's|^/||; s|/|-|g; s|^|-|')
-            if [ ! -d "$CC_PROJECTS/$PROJECT_PATH" ]; then
-                echo "No CC history for current directory"
-                echo "Use --all to search all projects"
+            # Content search: use index to get files, then grep
+            if [ -z "$QUERY" ]; then
+                echo "Usage: shuttle search <query> [options]"
+                echo "  Or use --list to list sessions without searching content"
                 exit 1
             fi
-            SEARCH_DIRS="$CC_PROJECTS/$PROJECT_PATH"
-        fi
 
-        echo "Searching for: $QUERY"
-        echo ""
-
-        # Search through session files, extract matching text
-        find "$SEARCH_DIRS" -name "*.jsonl" -type f 2>/dev/null | xargs grep -l "$QUERY" 2>/dev/null | while read -r FILE; do
-            # Get project name from path
-            PROJECT=$(basename "$(dirname "$FILE")" | sed 's/^-//; s/-/\//g')
-            SESSION_ID=$(basename "$FILE" .jsonl)
-
-            # Skip agent files
-            if [[ "$SESSION_ID" == agent-* ]]; then
-                continue
-            fi
-
-            # Get file modification time
-            MOD_TIME=$(stat -c %Y "$FILE" 2>/dev/null)
-            NOW=$(date +%s)
-            AGE=$(( (NOW - MOD_TIME) / 86400 ))
-            if [ "$AGE" -eq 0 ]; then
-                AGE_STR="today"
-            elif [ "$AGE" -eq 1 ]; then
-                AGE_STR="yesterday"
-            else
-                AGE_STR="${AGE}d ago"
-            fi
-
-            echo "=== $SESSION_ID ($AGE_STR) ==="
-            echo "    project: $PROJECT"
-
-            # Show matching lines with context (text content only)
-            grep "$QUERY" "$FILE" 2>/dev/null | head -3 | while read -r line; do
-                # Extract text content
-                TEXT=$(echo "$line" | jq -r '
-                    .message.content |
-                    if type == "string" then .
-                    elif type == "array" then
-                        [.[] | select(.type == "text") | .text] | join(" ")
-                    else ""
-                    end
-                ' 2>/dev/null | head -c 200)
-                if [ -n "$TEXT" ] && [ "$TEXT" != "null" ]; then
-                    echo "    ...$TEXT..."
-                fi
-            done
+            echo "Searching for: $QUERY"
             echo ""
-        done
+
+            # Get files from index, then grep them
+            jq -r "$JQ_FILTER | .[].value.file" "$SHUTTLE_INDEX_FILE" 2>/dev/null | while read -r FILE; do
+                if [ ! -f "$FILE" ]; then
+                    continue
+                fi
+
+                if ! grep -q "$QUERY" "$FILE" 2>/dev/null; then
+                    continue
+                fi
+
+                SESSION_ID=$(basename "$FILE" .jsonl)
+                PROJECT=$(jq -r ".sessions[\"$SESSION_ID\"].project" "$SHUTTLE_INDEX_FILE" 2>/dev/null)
+
+                # Get file modification time
+                MOD_TIME=$(stat -c %Y "$FILE" 2>/dev/null)
+                NOW=$(date +%s)
+                AGE=$(( (NOW - MOD_TIME) / 86400 ))
+                if [ "$AGE" -eq 0 ]; then
+                    AGE_STR="today"
+                elif [ "$AGE" -eq 1 ]; then
+                    AGE_STR="yesterday"
+                else
+                    AGE_STR="${AGE}d ago"
+                fi
+
+                echo "=== $SESSION_ID ($AGE_STR) ==="
+                echo "    project: $PROJECT"
+
+                # Show matching lines with context (text content only)
+                grep "$QUERY" "$FILE" 2>/dev/null | head -3 | while read -r line; do
+                    TEXT=$(echo "$line" | jq -r '
+                        .message.content |
+                        if type == "string" then .
+                        elif type == "array" then
+                            [.[] | select(.type == "text") | .text] | join(" ")
+                        else ""
+                        end
+                    ' 2>/dev/null | head -c 200)
+                    if [ -n "$TEXT" ] && [ "$TEXT" != "null" ]; then
+                        echo "    ...$TEXT..."
+                    fi
+                done
+                echo ""
+            done
+        fi
         ;;
 
     resume)
@@ -1114,6 +1193,180 @@ SHUTTLE_PROMPT_TIMEOUT=12
 EXAMPLE
         ;;
 
+    index|i)
+        # Index all CC sessions for fast search
+        SHUTTLE_INDEX_DIR="$HOME/.shuttle"
+        SHUTTLE_INDEX_FILE="$SHUTTLE_INDEX_DIR/index.json"
+        CC_PROJECTS="$HOME/.claude/projects"
+
+        # Parse options
+        UPDATE_MODE=""
+        VERBOSE=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --update|-u)
+                    UPDATE_MODE=1
+                    shift
+                    ;;
+                --verbose|-v)
+                    VERBOSE=1
+                    shift
+                    ;;
+                *)
+                    echo "Unknown option: $1"
+                    echo "Usage: shuttle index [--update] [--verbose]"
+                    exit 1
+                    ;;
+            esac
+        done
+
+        # Create index directory
+        mkdir -p "$SHUTTLE_INDEX_DIR"
+
+        # Load existing index for incremental updates
+        if [ -n "$UPDATE_MODE" ] && [ -f "$SHUTTLE_INDEX_FILE" ]; then
+            EXISTING_INDEX=$(cat "$SHUTTLE_INDEX_FILE")
+            # Pre-extract mtimes to temp file for fast lookup (avoids jq per file)
+            MTIME_CACHE=$(mktemp)
+            jq -r '.sessions | to_entries[] | "\(.key) \(.value.mtime)"' "$SHUTTLE_INDEX_FILE" > "$MTIME_CACHE" 2>/dev/null
+            # Also extract existing entries for unchanged files
+            ENTRIES_CACHE=$(mktemp)
+            jq -r '.sessions | to_entries[] | "\(.key)\t\(.value | @json)"' "$SHUTTLE_INDEX_FILE" > "$ENTRIES_CACHE" 2>/dev/null
+            trap "rm -f $MTIME_CACHE $ENTRIES_CACHE" EXIT
+            echo "Incremental update mode"
+        else
+            EXISTING_INDEX='{"version":1,"sessions":{}}'
+            MTIME_CACHE=""
+            ENTRIES_CACHE=""
+            echo "Full index rebuild"
+        fi
+
+        # Count files for progress
+        TOTAL_FILES=$(find "$CC_PROJECTS" -name "*.jsonl" -type f 2>/dev/null | grep -v '/agent-' | wc -l)
+        echo "Found $TOTAL_FILES session files to process"
+
+        # Process each session file
+        PROCESSED=0
+        SKIPPED=0
+        UPDATED=0
+
+        # Create temp file for building index
+        INDEX_TMP=$(mktemp)
+        trap "rm -f $INDEX_TMP" EXIT
+
+        # Start JSON structure
+        echo '{"version":1,"last_updated":"'"$(date -Is)"'","sessions":{' > "$INDEX_TMP"
+        FIRST_ENTRY=1
+
+        # Use process substitution to keep loop in main shell (for variable updates)
+        while read -r FILE; do
+            SESSION_ID=$(basename "$FILE" .jsonl)
+
+            # Get file mtime
+            FILE_MTIME=$(stat -c %Y "$FILE" 2>/dev/null)
+
+            # In update mode, check if file changed (using cached mtimes)
+            if [ -n "$UPDATE_MODE" ] && [ -n "$MTIME_CACHE" ]; then
+                INDEXED_MTIME=$(grep "^$SESSION_ID " "$MTIME_CACHE" 2>/dev/null | cut -d' ' -f2)
+                if [ "$FILE_MTIME" = "$INDEXED_MTIME" ]; then
+                    # File unchanged, copy existing entry from cache
+                    EXISTING_ENTRY=$(grep "^$SESSION_ID	" "$ENTRIES_CACHE" 2>/dev/null | cut -f2)
+                    if [ -n "$EXISTING_ENTRY" ]; then
+                        if [ "$FIRST_ENTRY" -eq 0 ]; then
+                            echo "," >> "$INDEX_TMP"
+                        fi
+                        echo "\"$SESSION_ID\":$EXISTING_ENTRY" >> "$INDEX_TMP"
+                        FIRST_ENTRY=0
+                        ((SKIPPED++)) || true
+                        continue
+                    fi
+                fi
+            fi
+
+            # Decode project path from directory name
+            ENCODED_PATH=$(basename "$(dirname "$FILE")")
+            PROJECT=$(echo "$ENCODED_PATH" | sed 's/^-//; s/-/\//g')
+            PROJECT="/$PROJECT"
+
+            # Skip empty files
+            if [ ! -s "$FILE" ]; then
+                continue
+            fi
+
+            # Extract metadata from file
+            # Get first timestamp and first user message
+            FIRST_LINE=$(head -1 "$FILE")
+            STARTED=$(echo "$FIRST_LINE" | jq -r '.timestamp // empty' 2>/dev/null)
+
+            # Get first user message for summary
+            FIRST_MSG=$(grep '"type":"user"' "$FILE" 2>/dev/null | head -1 | jq -r '
+                .message.content |
+                if type == "string" then .[0:150]
+                elif type == "array" then
+                    ([.[] | select(.type == "text") | .text] | join(" "))[0:150]
+                else ""
+                end
+            ' 2>/dev/null)
+
+            # Count messages (user + assistant entries) - strip whitespace
+            MSG_COUNT=$(grep -cE '"type":"(user|assistant)"' "$FILE" 2>/dev/null | tr -d '[:space:]')
+            MSG_COUNT=${MSG_COUNT:-0}
+
+            # Get last activity (use last line's timestamp or file mtime)
+            LAST_LINE=$(tail -1 "$FILE")
+            LAST_ACTIVITY=$(echo "$LAST_LINE" | jq -r '.timestamp // empty' 2>/dev/null)
+            if [ -z "$LAST_ACTIVITY" ]; then
+                LAST_ACTIVITY=$(date -Is -d "@$FILE_MTIME" 2>/dev/null || date -r "$FILE_MTIME" '+%Y-%m-%dT%H:%M:%S%z')
+            fi
+
+            # Build session entry
+            if [ "$FIRST_ENTRY" -eq 0 ]; then
+                echo "," >> "$INDEX_TMP"
+            fi
+
+            # Build JSON entry using jq for proper escaping, output as key:value
+            ENTRY_JSON=$(jq -n -c \
+                  --arg project "$PROJECT" \
+                  --arg file "$FILE" \
+                  --arg started "$STARTED" \
+                  --arg last "$LAST_ACTIVITY" \
+                  --argjson count "$MSG_COUNT" \
+                  --arg summary "$FIRST_MSG" \
+                  --argjson mtime "$FILE_MTIME" \
+                '{project:$project,file:$file,started:$started,last_activity:$last,message_count:$count,summary:$summary,mtime:$mtime}')
+            echo "\"$SESSION_ID\":$ENTRY_JSON" >> "$INDEX_TMP"
+            FIRST_ENTRY=0
+            ((UPDATED++)) || true
+
+            # Progress indicator
+            ((PROCESSED++)) || true
+            if [ -n "$VERBOSE" ]; then
+                echo "  [$PROCESSED/$TOTAL_FILES] $SESSION_ID"
+            elif [ $((PROCESSED % 100)) -eq 0 ]; then
+                echo "  Processed $PROCESSED/$TOTAL_FILES..."
+            fi
+        done < <(find "$CC_PROJECTS" -name "*.jsonl" -type f 2>/dev/null | grep -v '/agent-')
+
+        # Close JSON structure
+        echo '}' >> "$INDEX_TMP"
+        echo '}' >> "$INDEX_TMP"
+
+        # Validate and format JSON
+        if jq '.' "$INDEX_TMP" > "$SHUTTLE_INDEX_FILE" 2>/dev/null; then
+            SESSION_COUNT=$(jq '.sessions | length' "$SHUTTLE_INDEX_FILE")
+            echo ""
+            echo "Index complete: $SESSION_COUNT sessions"
+            if [ -n "$UPDATE_MODE" ]; then
+                echo "  Updated: $UPDATED, Skipped (unchanged): $SKIPPED"
+            fi
+            echo "Saved to: $SHUTTLE_INDEX_FILE"
+        else
+            echo "Error: Failed to create valid JSON index"
+            cat "$INDEX_TMP"
+            exit 1
+        fi
+        ;;
+
     help|--help|-h)
         cat << 'EOF'
 shuttle - Manage Claude Code agent sessions
@@ -1127,7 +1380,8 @@ Commands:
   peek, p <n> [lines]  Show last lines from session (default: 20)
   tail, t <n> [interval]  Live output stream from session (default: 1s refresh)
   context, ctx <n> [msgs]  Show conversation context (default: 10 messages)
-  search <query>  Search CC session history (--all for all projects)
+  index, i        Build/update session index for fast search
+  search <query>  Search CC session history (uses index)
   resume <id>     Resume a past CC session by UUID
   export, x <n|id>  Export session to markdown or JSON
   send <n> <msg>  Send message to session
@@ -1138,6 +1392,17 @@ Commands:
   unsplit         Close split pane
   ground          Kill all shuttle sessions
   config, cfg     Show current configuration
+
+Index options:
+  --update, -u    Incremental update (only changed files)
+  --verbose, -v   Show progress for each file
+
+Search options:
+  --all, -a        Search all projects (default: current project)
+  --list, -l       List sessions from index (no content search)
+  --since, -s N    Only sessions from last N days
+  --project, -p P  Filter by project path (substring match)
+  --limit, -n N    Limit results (default: 20)
 
 Options (for go, board, split, vsplit):
   -d, --dir PATH      Run in specified directory (go, split, vsplit)
@@ -1164,6 +1429,11 @@ Export options:
 Examples:
   shuttle                     # show status
   shuttle config              # show configuration
+  shuttle index               # build full session index
+  shuttle index --update      # incremental index update (~8s)
+  shuttle search --list -a    # list all sessions from index
+  shuttle search "auth" -a    # search content across all projects
+  shuttle search -l -s 7      # list sessions from last 7 days
   shuttle go brief-20251210-ceor
   shuttle go -p skein brief-20251210-ceor  # launch in skein project
   shuttle go --headless brief-id  # create session without opening terminal
