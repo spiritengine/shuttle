@@ -4,6 +4,55 @@
 
 set -e
 
+# =============================================================================
+# Configuration
+# =============================================================================
+
+# Default configuration values
+SHUTTLE_DEFAULT_PROJECT=""           # Default project directory (empty = use pwd)
+SHUTTLE_DEFAULT_SITE="ledger"        # Default site for briefs
+SHUTTLE_TERMINAL="gnome-terminal --" # Terminal emulator command
+SHUTTLE_HEADLESS_DEFAULT=""          # Default headless mode (empty = auto-detect)
+SHUTTLE_PROMPT_TIMEOUT=12            # Seconds to wait for Claude prompt
+
+# Config file locations (checked in order)
+SHUTTLE_CONFIG_PATHS=(
+    "${XDG_CONFIG_HOME:-$HOME/.config}/shuttle/config"
+    "$HOME/.shuttlerc"
+)
+
+# Load configuration from file if it exists
+load_config() {
+    for config_path in "${SHUTTLE_CONFIG_PATHS[@]}"; do
+        if [ -f "$config_path" ]; then
+            # Source bash-style KEY=value config
+            # shellcheck disable=SC1090
+            source "$config_path"
+            SHUTTLE_LOADED_CONFIG="$config_path"
+            return 0
+        fi
+    done
+    SHUTTLE_LOADED_CONFIG=""
+    return 0
+}
+
+# Get effective config value (precedence: env var > config file > default)
+# After load_config, variables are already set via sourcing
+# Env vars with same name will override (since they're not overwritten by source)
+
+# Load config at startup (before any command processing)
+load_config
+
+# Apply environment variable overrides (higher precedence than config file)
+[ -n "$SHUTTLE_PROJECT" ] && SHUTTLE_DEFAULT_PROJECT="$SHUTTLE_PROJECT"
+[ -n "$SHUTTLE_SITE" ] && SHUTTLE_DEFAULT_SITE="$SHUTTLE_SITE"
+[ -n "$SHUTTLE_TERM" ] && SHUTTLE_TERMINAL="$SHUTTLE_TERM"
+[ -n "$SHUTTLE_TIMEOUT" ] && SHUTTLE_PROMPT_TIMEOUT="$SHUTTLE_TIMEOUT"
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
 # Parse --dir, --project, and --headless options
 # Sets: PROJECT_DIR, HEADLESS, remaining args in POSITIONAL array
 parse_project_opts() {
@@ -48,13 +97,21 @@ parse_project_opts() {
         fi
     fi
 
-    # Default to current directory
+    # Default: config default project, or current directory
     if [ -z "$PROJECT_DIR" ]; then
-        PROJECT_DIR="$(pwd)"
+        if [ -n "$SHUTTLE_DEFAULT_PROJECT" ]; then
+            PROJECT_DIR="${SHUTTLE_DEFAULT_PROJECT/#\~/$HOME}"
+            if [ ! -d "$PROJECT_DIR" ]; then
+                echo "Warning: default_project not found: $PROJECT_DIR (using pwd)"
+                PROJECT_DIR="$(pwd)"
+            fi
+        else
+            PROJECT_DIR="$(pwd)"
+        fi
     fi
 
-    # Headless: explicit flag, env var, or no display
-    if [ -n "$SHUTTLE_HEADLESS" ] || [ -z "$DISPLAY" ]; then
+    # Headless: explicit flag, env var, config default, or no display
+    if [ -n "$SHUTTLE_HEADLESS" ] || [ -n "$SHUTTLE_HEADLESS_DEFAULT" ] || [ -z "$DISPLAY" ]; then
         HEADLESS=1
     fi
 }
@@ -69,6 +126,17 @@ tmux_send_cmd() {
     tmux send-keys -t "$target" "$message"
     sleep 0.1
     tmux send-keys -t "$target" Enter
+}
+
+# Launch terminal with given command
+# Uses configured SHUTTLE_TERMINAL, with dbus-launch wrapper for gnome-terminal
+launch_terminal() {
+    local cmd="$1"
+    if [[ "$SHUTTLE_TERMINAL" == gnome-terminal* ]]; then
+        dbus-launch $SHUTTLE_TERMINAL $cmd 2>/dev/null
+    else
+        $SHUTTLE_TERMINAL $cmd 2>/dev/null
+    fi
 }
 
 # Format seconds as relative time (e.g., "2m ago", "1h ago")
@@ -148,7 +216,7 @@ case "$CMD" in
         SHARDS_TMP=$(mktemp)
         trap "rm -f $BRIEFS_TMP $SHARDS_TMP" EXIT
 
-        (skein folios ledger --type brief --status open 2>/dev/null | grep "brief-" | head -5 > "$BRIEFS_TMP") &
+        (skein folios "$SHUTTLE_DEFAULT_SITE" --type brief --status open 2>/dev/null | grep "brief-" | head -5 > "$BRIEFS_TMP") &
         BRIEFS_PID=$!
         (skein shard triage 2>/dev/null | tail -n +3 > "$SHARDS_TMP") &
         SHARDS_PID=$!
@@ -244,7 +312,7 @@ case "$CMD" in
         if [ -n "$HEADLESS" ]; then
             tmux attach -t "$SESSION"
         else
-            dbus-launch gnome-terminal -- tmux attach -t "$SESSION" 2>/dev/null
+            launch_terminal "tmux attach -t $SESSION"
         fi
         ;;
 
@@ -558,7 +626,7 @@ case "$CMD" in
         if [ -n "$HEADLESS" ] || [ -n "$SHUTTLE_HEADLESS" ] || [ -z "$DISPLAY" ]; then
             echo "Attach with: tmux attach -t $TMUX_SESSION"
         else
-            dbus-launch gnome-terminal -- tmux attach -t "$TMUX_SESSION" 2>/dev/null
+            launch_terminal "tmux attach -t $TMUX_SESSION"
             echo "Launched $TMUX_SESSION"
         fi
         ;;
@@ -815,7 +883,7 @@ $CONTENT
             if [ -n "$HEADLESS" ]; then
                 echo "Attach with: tmux attach -t $SESSION"
             else
-                dbus-launch gnome-terminal -- tmux attach -t "$SESSION" 2>/dev/null
+                launch_terminal "tmux attach -t $SESSION"
             fi
             exit 0
         fi
@@ -825,9 +893,10 @@ $CONTENT
         # Create new tmux session running claude
         tmux new-session -d -s "$SESSION" -c "$PROJECT_DIR" "claude"
 
-        # Wait for claude prompt to appear
+        # Wait for claude prompt to appear (timeout based on config)
         echo "Waiting for Claude..."
-        for i in {1..60}; do
+        MAX_ITERATIONS=$((SHUTTLE_PROMPT_TIMEOUT * 5))  # 5 checks per second
+        for ((i=1; i<=MAX_ITERATIONS; i++)); do
             CAPTURED=$(tmux capture-pane -t "$SESSION" -p)
             # Look for Claude's prompt or shortcuts hint
             if echo "$CAPTURED" | grep -qE "^>|? for"; then
@@ -845,7 +914,7 @@ $CONTENT
             echo "Session ready: $SESSION"
             echo "Attach with: tmux attach -t $SESSION"
         else
-            dbus-launch gnome-terminal -- tmux attach -t "$SESSION" 2>/dev/null
+            launch_terminal "tmux attach -t $SESSION"
             echo "Launched $SESSION"
         fi
         ;;
@@ -880,9 +949,10 @@ $CONTENT
         # Create split running claude, capture the new pane ID
         NEW_PANE=$(tmux split-window $SPLIT_FLAG -c "$PROJECT_DIR" -P -F '#{pane_id}' "claude")
 
-        # Wait for claude prompt in the NEW pane
+        # Wait for claude prompt in the NEW pane (timeout based on config)
         echo "Waiting for Claude..."
-        for i in {1..60}; do
+        MAX_ITERATIONS=$((SHUTTLE_PROMPT_TIMEOUT * 5))  # 5 checks per second
+        for ((i=1; i<=MAX_ITERATIONS; i++)); do
             CAPTURED=$(tmux capture-pane -t "$NEW_PANE" -p)
             # Look for Claude's prompt or shortcuts hint
             if echo "$CAPTURED" | grep -qE "^>|? for"; then
@@ -934,6 +1004,54 @@ $CONTENT
         echo "Done."
         ;;
 
+    config|cfg)
+        echo "SHUTTLE CONFIGURATION"
+        echo ""
+        if [ -n "$SHUTTLE_LOADED_CONFIG" ]; then
+            echo "Config file: $SHUTTLE_LOADED_CONFIG"
+        else
+            echo "Config file: (none found)"
+            echo "  Checked locations:"
+            for path in "${SHUTTLE_CONFIG_PATHS[@]}"; do
+                echo "    - $path"
+            done
+        fi
+        echo ""
+        echo "Current settings:"
+        echo "  SHUTTLE_DEFAULT_PROJECT = ${SHUTTLE_DEFAULT_PROJECT:-(not set, uses pwd)}"
+        echo "  SHUTTLE_DEFAULT_SITE    = $SHUTTLE_DEFAULT_SITE"
+        echo "  SHUTTLE_TERMINAL        = $SHUTTLE_TERMINAL"
+        echo "  SHUTTLE_HEADLESS_DEFAULT= ${SHUTTLE_HEADLESS_DEFAULT:-(auto-detect)}"
+        echo "  SHUTTLE_PROMPT_TIMEOUT  = ${SHUTTLE_PROMPT_TIMEOUT}s"
+        echo ""
+        echo "Environment overrides (set these to override config):"
+        echo "  SHUTTLE_PROJECT  = ${SHUTTLE_PROJECT:-}"
+        echo "  SHUTTLE_SITE     = ${SHUTTLE_SITE:-}"
+        echo "  SHUTTLE_TERM     = ${SHUTTLE_TERM:-}"
+        echo "  SHUTTLE_HEADLESS = ${SHUTTLE_HEADLESS:-}"
+        echo "  SHUTTLE_TIMEOUT  = ${SHUTTLE_TIMEOUT:-}"
+        echo ""
+        echo "Example config file (~/.config/shuttle/config or ~/.shuttlerc):"
+        cat << 'EXAMPLE'
+# Shuttle configuration
+
+# Default project directory (empty = use pwd)
+SHUTTLE_DEFAULT_PROJECT=~/projects/main
+
+# Default SKEIN site for briefs
+SHUTTLE_DEFAULT_SITE=ledger
+
+# Terminal emulator command
+SHUTTLE_TERMINAL="gnome-terminal --"
+
+# Always run headless (set to 1, or leave empty for auto-detect)
+SHUTTLE_HEADLESS_DEFAULT=
+
+# Prompt detection timeout in seconds
+SHUTTLE_PROMPT_TIMEOUT=12
+EXAMPLE
+        ;;
+
     help|--help|-h)
         cat << 'EOF'
 shuttle - Manage Claude Code agent sessions
@@ -956,23 +1074,33 @@ Commands:
   vsplit, vs <brief> Open brief in vertical split pane
   unsplit         Close split pane
   ground          Kill all shuttle sessions
+  config, cfg     Show current configuration
 
 Options (for go, board, split, vsplit):
   -d, --dir PATH      Run in specified directory (go, split, vsplit)
   -p, --project NAME  Run in ~/projects/NAME (go, split, vsplit)
   --headless          Don't open GUI terminal (go, board)
-  (default: current directory, auto-headless if no $DISPLAY)
+  (default: current directory or SHUTTLE_DEFAULT_PROJECT, auto-headless if no $DISPLAY)
+
+Configuration:
+  Config file: ~/.config/shuttle/config or ~/.shuttlerc
+  See 'shuttle config' for current settings and example config.
+
+  Environment variables (override config file):
+    SHUTTLE_PROJECT   Default project directory
+    SHUTTLE_SITE      Default SKEIN site for briefs
+    SHUTTLE_TERM      Terminal emulator command
+    SHUTTLE_HEADLESS  Force headless mode (1 = always headless)
+    SHUTTLE_TIMEOUT   Prompt detection timeout in seconds
 
 Export options:
   --json, -j        Output as JSON instead of markdown
   --file, -f FILE   Write to file instead of stdout
   --last, -l N      Only include last N messages
 
-Environment:
-  SHUTTLE_HEADLESS=1  Force headless mode
-
 Examples:
   shuttle                     # show status
+  shuttle config              # show configuration
   shuttle go brief-20251210-ceor
   shuttle go -p skein brief-20251210-ceor  # launch in skein project
   shuttle go --headless brief-id  # create session without opening terminal
