@@ -623,8 +623,8 @@ case "$CMD" in
                 SESSION_ID=$(basename "$FILE" .jsonl)
                 PROJECT=$(jq -r ".sessions[\"$SESSION_ID\"].project" "$SHUTTLE_INDEX_FILE" 2>/dev/null)
 
-                # Get file modification time
-                MOD_TIME=$(stat -c %Y "$FILE" 2>/dev/null)
+                # Get file modification time (cross-platform)
+                MOD_TIME=$(stat -c %Y "$FILE" 2>/dev/null || stat -f %m "$FILE" 2>/dev/null || echo 0)
                 NOW=$(date +%s)
                 AGE=$(( (NOW - MOD_TIME) / 86400 ))
                 if [ "$AGE" -eq 0 ]; then
@@ -818,7 +818,7 @@ case "$CMD" in
         ENCODED_PATH=$(basename "$(dirname "$SESSION_FILE")")
         PROJECT=$(echo "$ENCODED_PATH" | sed 's/^-//; s/-/\//g')
         PROJECT="/$PROJECT"
-        FILE_DATE=$(stat -c %Y "$SESSION_FILE" 2>/dev/null)
+        FILE_DATE=$(stat -c %Y "$SESSION_FILE" 2>/dev/null || stat -f %m "$SESSION_FILE" 2>/dev/null || echo 0)
         DATE_STR=$(date -d "@$FILE_DATE" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || date -r "$FILE_DATE" "+%Y-%m-%d %H:%M:%S")
 
         # Read messages (optionally limited)
@@ -1000,6 +1000,27 @@ $CONTENT
         ;;
 
     go|g)
+        # Handle --help before parsing other options
+        for arg in "$@"; do
+            if [ "$arg" = "--help" ] || [ "$arg" = "-h" ]; then
+                echo "Usage: shuttle go [options] <brief-id>"
+                echo ""
+                echo "Launch a new Claude Code session on a SKEIN brief."
+                echo ""
+                echo "Options:"
+                echo "  -d, --dir PATH      Run in specified directory"
+                echo "  -p, --project NAME  Run in ~/projects/NAME"
+                echo "  --headless          Don't open GUI terminal"
+                echo "  -h, --help          Show this help"
+                echo ""
+                echo "Examples:"
+                echo "  shuttle go brief-20251210-ceor"
+                echo "  shuttle go -p skein brief-20251210-ceor"
+                echo "  shuttle go --headless brief-id"
+                exit 0
+            fi
+        done
+
         parse_project_opts "$@"
         set -- "${POSITIONAL[@]}"
 
@@ -1223,21 +1244,25 @@ EXAMPLE
         # Create index directory
         mkdir -p "$SHUTTLE_INDEX_DIR"
 
-        # Load existing index for incremental updates
+        # Cross-platform stat for mtime (GNU vs BSD/macOS)
+        get_mtime() {
+            stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
+        }
+
+        # Load existing index for incremental updates using associative arrays (O(1) lookup)
+        declare -A MTIME_CACHE
+        declare -A ENTRIES_CACHE
         if [ -n "$UPDATE_MODE" ] && [ -f "$SHUTTLE_INDEX_FILE" ]; then
-            EXISTING_INDEX=$(cat "$SHUTTLE_INDEX_FILE")
-            # Pre-extract mtimes to temp file for fast lookup (avoids jq per file)
-            MTIME_CACHE=$(mktemp)
-            jq -r '.sessions | to_entries[] | "\(.key) \(.value.mtime)"' "$SHUTTLE_INDEX_FILE" > "$MTIME_CACHE" 2>/dev/null
-            # Also extract existing entries for unchanged files
-            ENTRIES_CACHE=$(mktemp)
-            jq -r '.sessions | to_entries[] | "\(.key)\t\(.value | @json)"' "$SHUTTLE_INDEX_FILE" > "$ENTRIES_CACHE" 2>/dev/null
-            trap "rm -f $MTIME_CACHE $ENTRIES_CACHE" EXIT
-            echo "Incremental update mode"
+            echo "Incremental update mode - loading cache..."
+            # Load mtimes and entries into associative arrays for O(1) lookup
+            while IFS=$'\t' read -r key mtime; do
+                MTIME_CACHE["$key"]="$mtime"
+            done < <(jq -r '.sessions | to_entries[] | "\(.key)\t\(.value.mtime)"' "$SHUTTLE_INDEX_FILE" 2>/dev/null)
+            while IFS=$'\t' read -r key entry; do
+                ENTRIES_CACHE["$key"]="$entry"
+            done < <(jq -r '.sessions | to_entries[] | "\(.key)\t\(.value | @json)"' "$SHUTTLE_INDEX_FILE" 2>/dev/null)
+            echo "  Loaded ${#MTIME_CACHE[@]} cached entries"
         else
-            EXISTING_INDEX='{"version":1,"sessions":{}}'
-            MTIME_CACHE=""
-            ENTRIES_CACHE=""
             echo "Full index rebuild"
         fi
 
@@ -1258,24 +1283,29 @@ EXAMPLE
         echo '{"version":1,"last_updated":"'"$(date -Is)"'","sessions":{' > "$INDEX_TMP"
         FIRST_ENTRY=1
 
-        # Use process substitution to keep loop in main shell (for variable updates)
-        while read -r FILE; do
+        # Use process substitution with null delimiter for filenames with special chars
+        while IFS= read -r -d '' FILE; do
+            # Skip empty files first (before any expensive operations)
+            if [ ! -s "$FILE" ]; then
+                continue
+            fi
+
             SESSION_ID=$(basename "$FILE" .jsonl)
 
-            # Get file mtime
-            FILE_MTIME=$(stat -c %Y "$FILE" 2>/dev/null)
+            # Get file mtime using cross-platform function
+            FILE_MTIME=$(get_mtime "$FILE")
 
-            # In update mode, check if file changed (using cached mtimes)
-            if [ -n "$UPDATE_MODE" ] && [ -n "$MTIME_CACHE" ]; then
-                INDEXED_MTIME=$(grep "^$SESSION_ID " "$MTIME_CACHE" 2>/dev/null | cut -d' ' -f2)
-                if [ "$FILE_MTIME" = "$INDEXED_MTIME" ]; then
+            # In update mode, check if file changed (O(1) associative array lookup)
+            if [ -n "$UPDATE_MODE" ] && [ ${#MTIME_CACHE[@]} -gt 0 ]; then
+                INDEXED_MTIME="${MTIME_CACHE[$SESSION_ID]:-}"
+                if [ -n "$INDEXED_MTIME" ] && [ "$FILE_MTIME" = "$INDEXED_MTIME" ]; then
                     # File unchanged, copy existing entry from cache
-                    EXISTING_ENTRY=$(grep "^$SESSION_ID	" "$ENTRIES_CACHE" 2>/dev/null | cut -f2)
+                    EXISTING_ENTRY="${ENTRIES_CACHE[$SESSION_ID]:-}"
                     if [ -n "$EXISTING_ENTRY" ]; then
                         if [ "$FIRST_ENTRY" -eq 0 ]; then
                             echo "," >> "$INDEX_TMP"
                         fi
-                        echo "\"$SESSION_ID\":$EXISTING_ENTRY" >> "$INDEX_TMP"
+                        printf '"%s":%s\n' "$SESSION_ID" "$EXISTING_ENTRY" >> "$INDEX_TMP"
                         FIRST_ENTRY=0
                         ((SKIPPED++)) || true
                         continue
@@ -1287,11 +1317,6 @@ EXAMPLE
             ENCODED_PATH=$(basename "$(dirname "$FILE")")
             PROJECT=$(echo "$ENCODED_PATH" | sed 's/^-//; s/-/\//g')
             PROJECT="/$PROJECT"
-
-            # Skip empty files
-            if [ ! -s "$FILE" ]; then
-                continue
-            fi
 
             # Extract metadata from file
             # Get first timestamp and first user message
@@ -1345,7 +1370,7 @@ EXAMPLE
             elif [ $((PROCESSED % 100)) -eq 0 ]; then
                 echo "  Processed $PROCESSED/$TOTAL_FILES..."
             fi
-        done < <(find "$CC_PROJECTS" -name "*.jsonl" -type f 2>/dev/null | grep -v '/agent-')
+        done < <(find "$CC_PROJECTS" -name "*.jsonl" -type f -print0 2>/dev/null | grep -z -v '/agent-')
 
         # Close JSON structure
         echo '}' >> "$INDEX_TMP"
