@@ -858,6 +858,68 @@ $CONTENT
         tmux capture-pane -t "$SESSION" -p | tail -n "$LINES"
         ;;
 
+    tail|t)
+        TARGET="${1:-1}"
+        INTERVAL="${2:-1}"
+
+        if [[ "$TARGET" =~ ^[0-9]+$ ]]; then
+            SESSION=$(tmux ls 2>/dev/null | sed -n "${TARGET}p" | cut -d: -f1)
+        else
+            SESSION=$(tmux ls 2>/dev/null | grep "$TARGET" | head -1 | cut -d: -f1)
+        fi
+
+        if [ -z "$SESSION" ]; then
+            echo "Session not found: $TARGET"
+            exit 1
+        fi
+
+        echo "=== Tailing $SESSION (Ctrl-C to exit) ==="
+
+        # We track content by keeping a hash of the last capture
+        # and only showing new lines when content changes
+        LAST_HASH=""
+        LAST_LINE_COUNT=0
+
+        # Capture full pane including scrollback (-S - starts from beginning)
+        # Use temporary file to handle multi-line content properly
+        CAPTURE_FILE=$(mktemp)
+        trap "rm -f $CAPTURE_FILE" EXIT
+
+        while true; do
+            # Capture current pane content (full scrollback)
+            tmux capture-pane -t "$SESSION" -p -S - > "$CAPTURE_FILE" 2>/dev/null
+
+            # Get current line count
+            CURRENT_LINE_COUNT=$(wc -l < "$CAPTURE_FILE")
+
+            # Get hash of content to detect changes
+            CURRENT_HASH=$(md5sum "$CAPTURE_FILE" | cut -d' ' -f1)
+
+            if [ "$CURRENT_HASH" != "$LAST_HASH" ]; then
+                # Content changed - show new lines
+                if [ "$LAST_LINE_COUNT" -gt 0 ]; then
+                    # Show only lines after what we've already seen
+                    NEW_LINES=$((CURRENT_LINE_COUNT - LAST_LINE_COUNT))
+                    if [ "$NEW_LINES" -gt 0 ]; then
+                        tail -n "$NEW_LINES" "$CAPTURE_FILE"
+                    elif [ "$NEW_LINES" -lt 0 ]; then
+                        # Screen was cleared or scrollback reduced - show recent context
+                        echo "--- (screen cleared) ---"
+                        tail -n 5 "$CAPTURE_FILE"
+                    fi
+                else
+                    # First capture - show last 10 lines for context
+                    tail -n 10 "$CAPTURE_FILE"
+                fi
+
+                LAST_HASH="$CURRENT_HASH"
+                LAST_LINE_COUNT="$CURRENT_LINE_COUNT"
+            fi
+
+            sleep "$INTERVAL"
+        done
+        ;;
+
     go|g)
         parse_project_opts "$@"
         set -- "${POSITIONAL[@]}"
@@ -1063,6 +1125,7 @@ Commands:
   board, b <n>    Board session by number or name
   kill, k <n>     Kill session by number or name
   peek, p <n> [lines]  Show last lines from session (default: 20)
+  tail, t <n> [interval]  Live output stream from session (default: 1s refresh)
   context, ctx <n> [msgs]  Show conversation context (default: 10 messages)
   search <query>  Search CC session history (--all for all projects)
   resume <id>     Resume a past CC session by UUID
@@ -1108,6 +1171,8 @@ Examples:
   shuttle board 1             # board first session
   shuttle peek 1              # see what session 1 is doing
   shuttle peek 2 50           # last 50 lines from session 2
+  shuttle tail 1              # live output from session 1
+  shuttle tail 2 0.5          # faster refresh (0.5s interval)
   shuttle export 1            # export session 1 as markdown
   shuttle export 1 --json --file out.json  # export to JSON file
   shuttle send 1 "check the failing tests"  # nudge a session

@@ -12,6 +12,8 @@ shuttle split <brief>   # open brief in horizontal split pane
 shuttle vsplit <brief>  # open brief in vertical split pane
 shuttle unsplit         # close split pane
 shuttle board <n>    # attach to session
+shuttle peek <n>     # show last 20 lines from session
+shuttle tail <n>     # live output stream (Ctrl-C to exit)
 shuttle send <n> <msg>  # send message to session
 shuttle relay <n> <file>  # send file contents to session
 shuttle context <n>  # show conversation context from CC history
