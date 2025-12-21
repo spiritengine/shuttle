@@ -563,6 +563,214 @@ case "$CMD" in
         fi
         ;;
 
+    export|x)
+        # Parse options
+        OUTPUT_FORMAT="markdown"
+        OUTPUT_FILE=""
+        LAST_N=""
+        POSITIONAL=()
+
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --json|-j)
+                    OUTPUT_FORMAT="json"
+                    shift
+                    ;;
+                --file|-f)
+                    OUTPUT_FILE="$2"
+                    shift 2
+                    ;;
+                --last|-l)
+                    LAST_N="$2"
+                    shift 2
+                    ;;
+                *)
+                    POSITIONAL+=("$1")
+                    shift
+                    ;;
+            esac
+        done
+        set -- "${POSITIONAL[@]}"
+
+        if [ -z "$1" ]; then
+            echo "Usage: shuttle export <n|session-id> [options]"
+            echo "  Export a CC session to markdown or JSON"
+            echo ""
+            echo "Options:"
+            echo "  --json, -j        Output as JSON instead of markdown"
+            echo "  --file, -f FILE   Write to file instead of stdout"
+            echo "  --last, -l N      Only include last N messages"
+            echo ""
+            echo "Examples:"
+            echo "  shuttle export 1                    # export session 1 as markdown"
+            echo "  shuttle export 1 --json             # export as JSON"
+            echo "  shuttle export abc123-uuid --file out.md"
+            echo "  shuttle export 1 --last 20          # last 20 messages only"
+            exit 1
+        fi
+
+        TARGET="$1"
+        CC_PROJECTS="$HOME/.claude/projects"
+
+        # Determine if target is tmux session number/name or raw UUID
+        if [[ "$TARGET" =~ ^[0-9]+$ ]]; then
+            # Numeric: treat as tmux session index
+            SESSION=$(tmux ls 2>/dev/null | sed -n "${TARGET}p" | cut -d: -f1)
+            if [ -z "$SESSION" ]; then
+                echo "Session not found: $TARGET"
+                exit 1
+            fi
+            # Get session's working directory
+            CWD=$(tmux display-message -t "$SESSION" -p '#{pane_current_path}' 2>/dev/null)
+            if [ -z "$CWD" ]; then
+                echo "Could not get session working directory"
+                exit 1
+            fi
+            # Convert to CC project path
+            PROJECT_PATH=$(echo "$CWD" | sed 's|^/||; s|/|-|g; s|^|-|')
+            CC_PROJECT_DIR="$CC_PROJECTS/$PROJECT_PATH"
+            if [ ! -d "$CC_PROJECT_DIR" ]; then
+                echo "No CC history found for: $CWD"
+                exit 1
+            fi
+            # Find most recent session file
+            SESSION_FILE=$(ls -t "$CC_PROJECT_DIR"/*.jsonl 2>/dev/null | grep -v '/agent-' | head -1)
+            SESSION_ID=$(basename "$SESSION_FILE" .jsonl)
+        elif tmux has-session -t "$TARGET" 2>/dev/null; then
+            # Matches a tmux session name
+            CWD=$(tmux display-message -t "$TARGET" -p '#{pane_current_path}' 2>/dev/null)
+            if [ -z "$CWD" ]; then
+                echo "Could not get session working directory"
+                exit 1
+            fi
+            PROJECT_PATH=$(echo "$CWD" | sed 's|^/||; s|/|-|g; s|^|-|')
+            CC_PROJECT_DIR="$CC_PROJECTS/$PROJECT_PATH"
+            if [ ! -d "$CC_PROJECT_DIR" ]; then
+                echo "No CC history found for: $CWD"
+                exit 1
+            fi
+            SESSION_FILE=$(ls -t "$CC_PROJECT_DIR"/*.jsonl 2>/dev/null | grep -v '/agent-' | head -1)
+            SESSION_ID=$(basename "$SESSION_FILE" .jsonl)
+        else
+            # Treat as UUID - search for it
+            SESSION_ID="$TARGET"
+            SESSION_FILE=$(find "$CC_PROJECTS" -name "${SESSION_ID}.jsonl" -type f 2>/dev/null | head -1)
+            if [ -z "$SESSION_FILE" ]; then
+                # Try partial match
+                SESSION_FILE=$(find "$CC_PROJECTS" -name "*.jsonl" -type f 2>/dev/null | grep "$SESSION_ID" | head -1)
+            fi
+        fi
+
+        if [ -z "$SESSION_FILE" ] || [ ! -f "$SESSION_FILE" ]; then
+            echo "Session file not found: $TARGET"
+            echo "Use 'shuttle search' to find valid session IDs"
+            exit 1
+        fi
+
+        # Extract metadata
+        ENCODED_PATH=$(basename "$(dirname "$SESSION_FILE")")
+        PROJECT=$(echo "$ENCODED_PATH" | sed 's/^-//; s/-/\//g')
+        PROJECT="/$PROJECT"
+        FILE_DATE=$(stat -c %Y "$SESSION_FILE" 2>/dev/null)
+        DATE_STR=$(date -d "@$FILE_DATE" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || date -r "$FILE_DATE" "+%Y-%m-%d %H:%M:%S")
+
+        # Read messages (optionally limited)
+        if [ -n "$LAST_N" ]; then
+            MESSAGES=$(tail -n "$LAST_N" "$SESSION_FILE")
+        else
+            MESSAGES=$(cat "$SESSION_FILE")
+        fi
+
+        # Generate output
+        if [ "$OUTPUT_FORMAT" = "json" ]; then
+            # JSON output: array of cleaned message objects
+            OUTPUT=$(echo "$MESSAGES" | jq -s --arg session "$SESSION_ID" --arg project "$PROJECT" --arg date "$DATE_STR" '
+                {
+                    session_id: $session,
+                    project: $project,
+                    date: $date,
+                    messages: [
+                        .[] |
+                        select(.type == "user" or .type == "assistant") |
+                        {
+                            role: .message.role,
+                            content: (
+                                if .message.content | type == "string" then
+                                    .message.content
+                                elif .message.content | type == "array" then
+                                    [.message.content[] | select(.type == "text") | .text] | join("\n")
+                                else
+                                    ""
+                                end
+                            )
+                        } |
+                        select(.content != "" and .content != null)
+                    ]
+                }
+            ' 2>/dev/null)
+        else
+            # Markdown output
+            OUTPUT="# Session: $SESSION_ID
+
+Project: $PROJECT
+Date: $DATE_STR
+
+---
+"
+            # Process each message
+            while IFS= read -r line; do
+                TYPE=$(echo "$line" | jq -r '.type // "unknown"' 2>/dev/null)
+                ROLE=$(echo "$line" | jq -r '.message.role // ""' 2>/dev/null)
+
+                if [ "$TYPE" = "user" ] && [ "$ROLE" = "user" ]; then
+                    CONTENT=$(echo "$line" | jq -r '
+                        .message.content |
+                        if type == "string" then .
+                        elif type == "array" then
+                            [.[] | select(.type == "text") | .text] | join("\n")
+                        else ""
+                        end
+                    ' 2>/dev/null)
+                    if [ -n "$CONTENT" ] && [ "$CONTENT" != "null" ]; then
+                        OUTPUT+="
+## User
+
+$CONTENT
+
+"
+                    fi
+                elif [ "$TYPE" = "assistant" ] && [ "$ROLE" = "assistant" ]; then
+                    CONTENT=$(echo "$line" | jq -r '
+                        [.message.content[] | select(.type == "text") | .text] | join("\n")
+                    ' 2>/dev/null)
+                    if [ -n "$CONTENT" ] && [ "$CONTENT" != "null" ]; then
+                        OUTPUT+="
+## Claude
+
+$CONTENT
+
+"
+                    fi
+                fi
+            done <<< "$MESSAGES"
+        fi
+
+        # Output to file or stdout
+        if [ -n "$OUTPUT_FILE" ]; then
+            echo "$OUTPUT" > "$OUTPUT_FILE"
+            echo "Exported to: $OUTPUT_FILE"
+            if [ "$OUTPUT_FORMAT" = "json" ]; then
+                MSG_COUNT=$(echo "$OUTPUT" | jq '.messages | length' 2>/dev/null || echo "?")
+            else
+                MSG_COUNT=$(echo "$OUTPUT" | grep -c "^## " || echo "?")
+            fi
+            echo "  Session: $SESSION_ID"
+            echo "  Messages: $MSG_COUNT"
+        else
+            echo "$OUTPUT"
+        fi
+        ;;
+
     peek|p)
         TARGET="${1:-1}"
         LINES="${2:-20}"
@@ -739,7 +947,8 @@ Commands:
   peek, p <n> [lines]  Show last lines from session (default: 20)
   context, ctx <n> [msgs]  Show conversation context (default: 10 messages)
   search <query>  Search CC session history (--all for all projects)
-  resume <id>   Resume a past CC session by UUID
+  resume <id>     Resume a past CC session by UUID
+  export, x <n|id>  Export session to markdown or JSON
   send <n> <msg>  Send message to session
   relay <n> <file>  Send file contents to session (use '-' for stdin)
   go, g <brief>   Launch new session on a brief
@@ -754,6 +963,11 @@ Options (for go, board, split, vsplit):
   --headless          Don't open GUI terminal (go, board)
   (default: current directory, auto-headless if no $DISPLAY)
 
+Export options:
+  --json, -j        Output as JSON instead of markdown
+  --file, -f FILE   Write to file instead of stdout
+  --last, -l N      Only include last N messages
+
 Environment:
   SHUTTLE_HEADLESS=1  Force headless mode
 
@@ -766,6 +980,8 @@ Examples:
   shuttle board 1             # board first session
   shuttle peek 1              # see what session 1 is doing
   shuttle peek 2 50           # last 50 lines from session 2
+  shuttle export 1            # export session 1 as markdown
+  shuttle export 1 --json --file out.json  # export to JSON file
   shuttle send 1 "check the failing tests"  # nudge a session
   shuttle send 2 "skein torch"  # trigger retirement
   shuttle kill diverge        # kill session matching 'diverge'

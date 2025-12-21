@@ -17,6 +17,7 @@ shuttle relay <n> <file>  # send file contents to session
 shuttle context <n>  # show conversation context from CC history
 shuttle search <q>   # search CC session history (--all for all projects)
 shuttle resume <id>  # resume past session by UUID (from search)
+shuttle export <n|id>  # export session to markdown or JSON
 shuttle ls           # list sessions
 shuttle kill <n>     # kill session
 shuttle ground       # kill all shuttle sessions
