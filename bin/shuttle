@@ -1287,7 +1287,9 @@ EXAMPLE
         trap "rm -f $INDEX_TMP" EXIT
 
         # Start JSON structure
-        echo '{"version":1,"last_updated":"'"$(date -Is)"'","sessions":{' > "$INDEX_TMP"
+        # Cross-platform ISO 8601 date
+        LAST_UPDATED=$(date -Is 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
+        echo '{"version":1,"last_updated":"'"$LAST_UPDATED"'","sessions":{' > "$INDEX_TMP"
         FIRST_ENTRY=1
 
         # Use process substitution with null delimiter for filenames with special chars
@@ -1312,8 +1314,9 @@ EXAMPLE
                         if [ "$FIRST_ENTRY" -eq 0 ]; then
                             echo "," >> "$INDEX_TMP"
                         fi
-                        # Only use jq escaping if SESSION_ID contains special chars
-                        if [[ "$SESSION_ID" =~ [\"\\] ]]; then
+                        # Use jq escaping for IDs with special chars (quotes, backslashes, control chars)
+                        # Fast path for clean UUIDs (99.99% of cases)
+                        if [[ "$SESSION_ID" =~ [\"\\[:cntrl:]] ]]; then
                             ESCAPED_ID=$(printf '%s' "$SESSION_ID" | jq -Rs '.')
                         else
                             ESCAPED_ID="\"$SESSION_ID\""
@@ -1393,8 +1396,11 @@ EXAMPLE
         echo '}' >> "$INDEX_TMP"
         echo '}' >> "$INDEX_TMP"
 
-        # Validate and format JSON
-        if jq '.' "$INDEX_TMP" > "$SHUTTLE_INDEX_FILE" 2>/dev/null; then
+        # Validate and format JSON, then atomic rename
+        INDEX_TMP_FORMATTED=$(mktemp)
+        if jq '.' "$INDEX_TMP" > "$INDEX_TMP_FORMATTED" 2>/dev/null; then
+            # Atomic write: mv is atomic on same filesystem
+            mv "$INDEX_TMP_FORMATTED" "$SHUTTLE_INDEX_FILE"
             SESSION_COUNT=$(jq '.sessions | length' "$SHUTTLE_INDEX_FILE")
             echo ""
             echo "Index complete: $SESSION_COUNT sessions"
@@ -1403,6 +1409,7 @@ EXAMPLE
             fi
             echo "Saved to: $SHUTTLE_INDEX_FILE"
         else
+            rm -f "$INDEX_TMP_FORMATTED"
             echo "Error: Failed to create valid JSON index"
             cat "$INDEX_TMP"
             exit 1
