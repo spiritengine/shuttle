@@ -21,6 +21,7 @@ shuttle export <n|id>  # export session to markdown or JSON
 shuttle ls           # list sessions
 shuttle kill <n>     # kill session
 shuttle ground       # kill all shuttle sessions
+shuttle config       # show current configuration
 ```
 
 ## Session State Indicators
@@ -79,9 +80,34 @@ shuttle go brief-20251210-ceor
 
 This opens a new terminal with CC already ignited on the brief.
 
+## Configuration
+
+Shuttle reads settings from `~/.config/shuttle/config` or `~/.shuttlerc`:
+
+```bash
+# Default project directory (empty = use pwd)
+SHUTTLE_DEFAULT_PROJECT=~/projects/main
+
+# Default SKEIN site for briefs
+SHUTTLE_DEFAULT_SITE=ledger
+
+# Terminal emulator command
+SHUTTLE_TERMINAL="gnome-terminal --"
+
+# Always run headless (set to 1, or leave empty for auto-detect)
+SHUTTLE_HEADLESS_DEFAULT=
+
+# Prompt detection timeout in seconds
+SHUTTLE_PROMPT_TIMEOUT=12
+```
+
+Precedence: CLI flags > Environment variables > Config file > Defaults
+
+Run `shuttle config` to see current settings.
+
 ## Architecture
 
 - Single bash script at `bin/shuttle`
 - Uses tmux for session management
-- Uses gnome-terminal for new windows
+- Uses configurable terminal emulator (default: gnome-terminal)
 - Integrates with SKEIN for briefs and shards
