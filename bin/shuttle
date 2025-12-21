@@ -1241,8 +1241,11 @@ EXAMPLE
             esac
         done
 
-        # Create index directory
-        mkdir -p "$SHUTTLE_INDEX_DIR"
+        # Create index directory (fail early if not possible)
+        if ! mkdir -p "$SHUTTLE_INDEX_DIR" 2>/dev/null; then
+            echo "Error: Cannot create index directory $SHUTTLE_INDEX_DIR"
+            exit 1
+        fi
 
         # Cross-platform stat for mtime (GNU vs BSD/macOS)
         get_mtime() {
@@ -1293,6 +1296,9 @@ EXAMPLE
         echo '{"version":1,"last_updated":"'"$LAST_UPDATED"'","sessions":{' > "$INDEX_TMP"
         FIRST_ENTRY=1
 
+        # Track seen session IDs to prevent duplicates (invalid JSON)
+        declare -A SEEN_IDS
+
         # Use process substitution with null delimiter for filenames with special chars
         while IFS= read -r -d '' FILE; do
             # Skip empty files first (before any expensive operations)
@@ -1301,6 +1307,13 @@ EXAMPLE
             fi
 
             SESSION_ID=$(basename "$FILE" .jsonl)
+
+            # Skip duplicate session IDs (would produce invalid JSON)
+            if [ -n "${SEEN_IDS[$SESSION_ID]:-}" ]; then
+                [ -n "$VERBOSE" ] && echo "  Warning: Duplicate session ID $SESSION_ID, skipping"
+                continue
+            fi
+            SEEN_IDS[$SESSION_ID]=1
 
             # Get file mtime using cross-platform function
             FILE_MTIME=$(get_mtime "$FILE")
@@ -1315,9 +1328,9 @@ EXAMPLE
                         if [ "$FIRST_ENTRY" -eq 0 ]; then
                             echo "," >> "$INDEX_TMP"
                         fi
-                        # Use jq escaping for IDs with special chars (quotes, backslashes, control chars)
+                        # Use jq escaping for IDs with special chars (quotes, backslashes, shell metachars, control)
                         # Fast path for clean UUIDs (99.99% of cases)
-                        if [[ "$SESSION_ID" =~ [\"\\[:cntrl:]] ]]; then
+                        if [[ "$SESSION_ID" =~ [\"\\\$\`[:cntrl:]] ]]; then
                             ESCAPED_ID=$(printf '%s' "$SESSION_ID" | jq -Rs '.')
                         else
                             ESCAPED_ID="\"$SESSION_ID\""
@@ -1381,7 +1394,7 @@ EXAMPLE
                   --argjson mtime "$FILE_MTIME" \
                 '{project:$project,file:$file,started:$started,last_activity:$last,message_count:$count,summary:$summary,mtime:$mtime}')
             # Use jq escaping for IDs with special chars (same as SKIPPED path)
-            if [[ "$SESSION_ID" =~ [\"\\[:cntrl:]] ]]; then
+            if [[ "$SESSION_ID" =~ [\"\\\$\`[:cntrl:]] ]]; then
                 ESCAPED_ID=$(printf '%s' "$SESSION_ID" | jq -Rs '.')
             else
                 ESCAPED_ID="\"$SESSION_ID\""
