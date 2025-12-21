@@ -1253,16 +1253,23 @@ EXAMPLE
         declare -A MTIME_CACHE
         declare -A ENTRIES_CACHE
         if [ -n "$UPDATE_MODE" ] && [ -f "$SHUTTLE_INDEX_FILE" ]; then
-            echo "Incremental update mode - loading cache..."
-            # Load mtimes and entries into associative arrays for O(1) lookup
-            while IFS=$'\t' read -r key mtime; do
-                MTIME_CACHE["$key"]="$mtime"
-            done < <(jq -r '.sessions | to_entries[] | "\(.key)\t\(.value.mtime)"' "$SHUTTLE_INDEX_FILE" 2>/dev/null)
-            while IFS=$'\t' read -r key entry; do
-                ENTRIES_CACHE["$key"]="$entry"
-            done < <(jq -r '.sessions | to_entries[] | "\(.key)\t\(.value | @json)"' "$SHUTTLE_INDEX_FILE" 2>/dev/null)
-            echo "  Loaded ${#MTIME_CACHE[@]} cached entries"
-        else
+            # Validate index before loading
+            if ! jq -e '.version and .sessions' "$SHUTTLE_INDEX_FILE" >/dev/null 2>&1; then
+                echo "Warning: Index file is corrupted or invalid, performing full rebuild"
+                UPDATE_MODE=""
+            else
+                echo "Incremental update mode - loading cache..."
+                # Load mtimes and entries into associative arrays for O(1) lookup
+                while IFS=$'\t' read -r key mtime; do
+                    MTIME_CACHE["$key"]="$mtime"
+                done < <(jq -r '.sessions | to_entries[] | "\(.key)\t\(.value.mtime)"' "$SHUTTLE_INDEX_FILE" 2>/dev/null)
+                while IFS=$'\t' read -r key entry; do
+                    ENTRIES_CACHE["$key"]="$entry"
+                done < <(jq -r '.sessions | to_entries[] | "\(.key)\t\(.value | @json)"' "$SHUTTLE_INDEX_FILE" 2>/dev/null)
+                echo "  Loaded ${#MTIME_CACHE[@]} cached entries"
+            fi
+        fi
+        if [ -z "$UPDATE_MODE" ]; then
             echo "Full index rebuild"
         fi
 
@@ -1305,7 +1312,13 @@ EXAMPLE
                         if [ "$FIRST_ENTRY" -eq 0 ]; then
                             echo "," >> "$INDEX_TMP"
                         fi
-                        printf '"%s":%s\n' "$SESSION_ID" "$EXISTING_ENTRY" >> "$INDEX_TMP"
+                        # Only use jq escaping if SESSION_ID contains special chars
+                        if [[ "$SESSION_ID" =~ [\"\\] ]]; then
+                            ESCAPED_ID=$(printf '%s' "$SESSION_ID" | jq -Rs '.')
+                        else
+                            ESCAPED_ID="\"$SESSION_ID\""
+                        fi
+                        printf '%s:%s\n' "$ESCAPED_ID" "$EXISTING_ENTRY" >> "$INDEX_TMP"
                         FIRST_ENTRY=0
                         ((SKIPPED++)) || true
                         continue
@@ -1333,9 +1346,13 @@ EXAMPLE
                 end
             ' 2>/dev/null)
 
-            # Count messages (user + assistant entries) - strip whitespace
-            MSG_COUNT=$(grep -cE '"type":"(user|assistant)"' "$FILE" 2>/dev/null | tr -d '[:space:]')
-            MSG_COUNT=${MSG_COUNT:-0}
+            # Count messages (user + assistant entries)
+            # Use -a to treat binary files as text, validate result is numeric
+            MSG_COUNT=$(grep -caE '"type":"(user|assistant)"' "$FILE" 2>/dev/null | tr -d '[:space:]')
+            # Ensure MSG_COUNT is numeric (grep on binary can return warnings)
+            if ! [[ "$MSG_COUNT" =~ ^[0-9]+$ ]]; then
+                MSG_COUNT=0
+            fi
 
             # Get last activity (use last line's timestamp or file mtime)
             LAST_LINE=$(tail -1 "$FILE")
