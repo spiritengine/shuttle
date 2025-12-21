@@ -1273,8 +1273,8 @@ EXAMPLE
             echo "Full index rebuild"
         fi
 
-        # Count files for progress
-        TOTAL_FILES=$(find "$CC_PROJECTS" -name "*.jsonl" -type f 2>/dev/null | grep -v '/agent-' | wc -l)
+        # Count files for progress (consistent with null-delimited processing)
+        TOTAL_FILES=$(find "$CC_PROJECTS" -name "*.jsonl" -type f -print0 2>/dev/null | grep -zc -v '/agent-' || echo 0)
         echo "Found $TOTAL_FILES session files to process"
 
         # Process each session file
@@ -1282,9 +1282,10 @@ EXAMPLE
         SKIPPED=0
         UPDATED=0
 
-        # Create temp file for building index
-        INDEX_TMP=$(mktemp)
-        trap "rm -f $INDEX_TMP" EXIT
+        # Create temp file for building index (in same dir for atomic mv)
+        INDEX_TMP=$(mktemp -p "$SHUTTLE_INDEX_DIR" 2>/dev/null || mktemp)
+        INDEX_TMP_FORMATTED=""
+        trap 'rm -f "$INDEX_TMP" "$INDEX_TMP_FORMATTED"' EXIT
 
         # Start JSON structure
         # Cross-platform ISO 8601 date
@@ -1379,7 +1380,13 @@ EXAMPLE
                   --arg summary "$FIRST_MSG" \
                   --argjson mtime "$FILE_MTIME" \
                 '{project:$project,file:$file,started:$started,last_activity:$last,message_count:$count,summary:$summary,mtime:$mtime}')
-            echo "\"$SESSION_ID\":$ENTRY_JSON" >> "$INDEX_TMP"
+            # Use jq escaping for IDs with special chars (same as SKIPPED path)
+            if [[ "$SESSION_ID" =~ [\"\\[:cntrl:]] ]]; then
+                ESCAPED_ID=$(printf '%s' "$SESSION_ID" | jq -Rs '.')
+            else
+                ESCAPED_ID="\"$SESSION_ID\""
+            fi
+            printf '%s:%s\n' "$ESCAPED_ID" "$ENTRY_JSON" >> "$INDEX_TMP"
             FIRST_ENTRY=0
             ((UPDATED++)) || true
 
@@ -1390,14 +1397,14 @@ EXAMPLE
             elif [ $((PROCESSED % 100)) -eq 0 ]; then
                 echo "  Processed $PROCESSED/$TOTAL_FILES..."
             fi
-        done < <(find "$CC_PROJECTS" -name "*.jsonl" -type f -print0 2>/dev/null | grep -z -v '/agent-')
+        done < <(find "$CC_PROJECTS" -name "*.jsonl" -type f -print0 2>/dev/null | grep -z -v '/agent-' || true)
 
         # Close JSON structure
         echo '}' >> "$INDEX_TMP"
         echo '}' >> "$INDEX_TMP"
 
         # Validate and format JSON, then atomic rename
-        INDEX_TMP_FORMATTED=$(mktemp)
+        INDEX_TMP_FORMATTED=$(mktemp -p "$SHUTTLE_INDEX_DIR" 2>/dev/null || mktemp)
         if jq '.' "$INDEX_TMP" > "$INDEX_TMP_FORMATTED" 2>/dev/null; then
             # Atomic write: mv is atomic on same filesystem
             mv "$INDEX_TMP_FORMATTED" "$SHUTTLE_INDEX_FILE"
