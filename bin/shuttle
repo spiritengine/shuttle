@@ -179,8 +179,9 @@ detect_session_state() {
         return
     fi
 
-    # Check for waiting at prompt (> or ❯ character)
-    if echo "$content" | tail -5 | grep -qE "^>|^❯"; then
+    # Check for waiting at prompt (> or ❯ character with trailing space)
+    # Anchored pattern prevents false matches in quoted diff output
+    if echo "$content" | tail -5 | grep -qE "^> $|^❯ $"; then
         echo "waiting"
         return
     fi
@@ -384,16 +385,22 @@ case "$CMD" in
 
         # Check session state before sending
         NOW=$(date +%s)
-        ACTIVITY=$(tmux list-sessions -F '#{session_name}|#{session_activity}' 2>/dev/null | grep "^$SESSION|" | cut -d'|' -f2)
+        ACTIVITY=$(tmux list-sessions -F '#{session_name}|#{session_activity}' 2>/dev/null | grep -F "$SESSION|" | cut -d'|' -f2)
         IDLE=$((NOW - ACTIVITY))
         STATE=$(detect_session_state "$SESSION" "$IDLE")
 
         if [ -n "$WAIT_FOR_PROMPT" ]; then
-            # Wait for session to reach prompt state
+            # Wait for session to reach prompt state (use configured timeout)
+            WAIT_ITERATIONS=$((SHUTTLE_PROMPT_TIMEOUT * 2))  # 2 checks per second
             echo "Waiting for $SESSION to reach prompt..."
-            for ((i=1; i<=60; i++)); do  # 30 seconds max (60 * 0.5s)
+            for ((i=1; i<=WAIT_ITERATIONS; i++)); do
                 NOW=$(date +%s)
-                ACTIVITY=$(tmux list-sessions -F '#{session_name}|#{session_activity}' 2>/dev/null | grep "^$SESSION|" | cut -d'|' -f2)
+                ACTIVITY=$(tmux list-sessions -F '#{session_name}|#{session_activity}' 2>/dev/null | grep -F "$SESSION|" | cut -d'|' -f2)
+                # Detect session disappearance
+                if [ -z "$ACTIVITY" ]; then
+                    echo "Error: Session '$SESSION' no longer exists"
+                    exit 1
+                fi
                 IDLE=$((NOW - ACTIVITY))
                 STATE=$(detect_session_state "$SESSION" "$IDLE")
                 if [ "$STATE" = "waiting" ]; then
@@ -435,11 +442,27 @@ case "$CMD" in
         # Brief verification that something happened
         sleep 0.3
         NEW_STATE=$(detect_session_state "$SESSION" 0)
-        if [ "$NEW_STATE" = "working" ]; then
-            echo "✓ Claude is processing your message"
-        elif [ "$NEW_STATE" = "waiting" ] && [ "$STATE" = "waiting" ]; then
-            echo "Note: Session still at prompt - message may not have been accepted"
-        fi
+        case "$NEW_STATE" in
+            working)
+                echo "✓ Claude is processing your message"
+                ;;
+            waiting)
+                if [ "$STATE" = "waiting" ]; then
+                    echo "Note: Session still at prompt - message may not have been accepted"
+                else
+                    echo "✓ Message sent, session now at prompt"
+                fi
+                ;;
+            approval)
+                echo "Note: Session is now awaiting approval"
+                ;;
+            stuck)
+                echo "Warning: Session appears stuck after send"
+                ;;
+            unknown)
+                echo "Note: Could not determine session state after send"
+                ;;
+        esac
         ;;
 
     relay)
@@ -510,16 +533,22 @@ case "$CMD" in
 
         # Check session state before sending
         NOW=$(date +%s)
-        ACTIVITY=$(tmux list-sessions -F '#{session_name}|#{session_activity}' 2>/dev/null | grep "^$SESSION|" | cut -d'|' -f2)
+        ACTIVITY=$(tmux list-sessions -F '#{session_name}|#{session_activity}' 2>/dev/null | grep -F "$SESSION|" | cut -d'|' -f2)
         IDLE=$((NOW - ACTIVITY))
         STATE=$(detect_session_state "$SESSION" "$IDLE")
 
         if [ -n "$WAIT_FOR_PROMPT" ]; then
-            # Wait for session to reach prompt state
+            # Wait for session to reach prompt state (use configured timeout)
+            WAIT_ITERATIONS=$((SHUTTLE_PROMPT_TIMEOUT * 2))  # 2 checks per second
             echo "Waiting for $SESSION to reach prompt..."
-            for ((i=1; i<=60; i++)); do  # 30 seconds max (60 * 0.5s)
+            for ((i=1; i<=WAIT_ITERATIONS; i++)); do
                 NOW=$(date +%s)
-                ACTIVITY=$(tmux list-sessions -F '#{session_name}|#{session_activity}' 2>/dev/null | grep "^$SESSION|" | cut -d'|' -f2)
+                ACTIVITY=$(tmux list-sessions -F '#{session_name}|#{session_activity}' 2>/dev/null | grep -F "$SESSION|" | cut -d'|' -f2)
+                # Detect session disappearance
+                if [ -z "$ACTIVITY" ]; then
+                    echo "Error: Session '$SESSION' no longer exists"
+                    exit 1
+                fi
                 IDLE=$((NOW - ACTIVITY))
                 STATE=$(detect_session_state "$SESSION" "$IDLE")
                 if [ "$STATE" = "waiting" ]; then
