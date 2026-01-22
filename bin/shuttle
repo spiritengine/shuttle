@@ -1031,7 +1031,8 @@ $CONTENT
         BRIEF_ID="$1"
 
         # Get brief title for human-readable session name
-        BRIEF_TITLE=$(skein folio "$BRIEF_ID" 2>/dev/null | grep "^    #" | head -1 | sed 's/^[[:space:]]*#[[:space:]]*//' | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g' | sed 's/--*/-/g' | cut -c1-25)
+        # Use pwd for SKEIN lookup (brief lives where user is), not SHUTTLE_DEFAULT_PROJECT
+        BRIEF_TITLE=$(SKEIN_PROJECT="$(pwd)" skein folio "$BRIEF_ID" 2>/dev/null | grep "^    #" | head -1 | sed 's/^[[:space:]]*#[[:space:]]*//' | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g' | sed 's/--*/-/g' | cut -c1-25)
 
         if [ -z "$BRIEF_TITLE" ]; then
             SESSION="shuttle-${BRIEF_ID}"
