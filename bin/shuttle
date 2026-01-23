@@ -979,8 +979,11 @@ case "$CMD" in
         DATE_STR=$(date -d "@$FILE_DATE" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || date -r "$FILE_DATE" "+%Y-%m-%d %H:%M:%S")
 
         # Read messages (optionally limited)
+        # Note: --last N means "last N messages" not "last N JSONL lines"
+        # CC session files have mixed record types (user, assistant, summary, etc.)
+        # We filter to user/assistant first, THEN limit to last N
         if [ -n "$LAST_N" ]; then
-            MESSAGES=$(tail -n "$LAST_N" "$SESSION_FILE")
+            MESSAGES=$(jq -c 'select(.type == "user" or .type == "assistant")' "$SESSION_FILE" | tail -n "$LAST_N")
         else
             MESSAGES=$(cat "$SESSION_FILE")
         fi
