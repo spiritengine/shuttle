@@ -168,14 +168,24 @@ detect_session_state() {
     fi
 
     # Check for approval prompt (highest priority - needs human action)
+    # Patterns: "Do you want to proceed?", "❯ 1. Yes", "Allow once", "Allow always"
     if echo "$content" | grep -qE "Do you want to proceed\?|❯ 1\. Yes|Allow once|Allow always"; then
         echo "approval"
         return
     fi
 
-    # Check for actively working indicators
-    if echo "$content" | grep -qE "\(esc to interrupt|Running…|✶ [A-Z].*…|✻ [A-Z].*…|\* [A-Z].*…"; then
-        echo "working"
+    # Check for tool currently running (shows "Running…" after tool name)
+    # Pattern: "⎿  Running…" or similar indented Running indicator
+    if echo "$content" | grep -qE "Running…"; then
+        echo "running"
+        return
+    fi
+
+    # Check for thinking/processing state (before tool execution)
+    # Pattern: "✻ Verb…" or "✶ Verb…" with "(esc to interrupt)"
+    # These are Claude's animated "thinking" indicators like "✻ Noodling…", "✻ Pondering…"
+    if echo "$content" | grep -qE "✶ [A-Za-z].*…|✻ [A-Za-z].*…|esc to interrupt"; then
+        echo "thinking"
         return
     fi
 
@@ -199,11 +209,12 @@ detect_session_state() {
 format_state() {
     local state="$1"
     case "$state" in
-        working)  echo "⚡" ;;
-        approval) echo "🔒" ;;
-        waiting)  echo "💤" ;;
-        stuck)    echo "⚠️ " ;;
-        *)        echo "○" ;;
+        running)  echo "⏳" ;;  # Tool is running (waiting for output)
+        thinking) echo "🧠" ;;  # Claude is thinking/processing (before tool call)
+        approval) echo "🔒" ;;  # Waiting for user permission
+        waiting)  echo "💤" ;;  # At prompt, waiting for input
+        stuck)    echo "⚠️ " ;; # Idle too long with unclear state
+        *)        echo "○" ;;   # Unknown state
     esac
 }
 
