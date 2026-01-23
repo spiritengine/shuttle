@@ -73,6 +73,20 @@ shuttle send 2 "skein torch"  # trigger retirement
 shuttle send myproject "look at src/auth.py"
 ```
 
+The `send` command checks session state before sending:
+- If Claude is working/processing, it warns and refuses (use `--force` to override)
+- If Claude is in approval mode, it warns and refuses
+- Only sends when Claude is waiting at the prompt
+
+Options:
+- `--wait, -w` - Wait for session to reach prompt (up to 30s)
+- `--force, -f` - Send regardless of session state
+
+```bash
+shuttle send --wait 1 "message"   # wait for prompt, then send
+shuttle send --force 1 "urgent"   # send immediately regardless of state
+```
+
 Useful for nudging agents, giving directions, or triggering retirement.
 
 ## For Agents

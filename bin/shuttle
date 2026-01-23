@@ -179,8 +179,9 @@ detect_session_state() {
         return
     fi
 
-    # Check for waiting at prompt
-    if echo "$content" | tail -5 | grep -qE "^>"; then
+    # Check for waiting at prompt (> or ❯ character with trailing space)
+    # Anchored pattern prevents false matches in quoted diff output
+    if echo "$content" | tail -5 | grep -qE "^> $|^❯ $"; then
         echo "waiting"
         return
     fi
@@ -339,8 +340,32 @@ case "$CMD" in
         ;;
 
     send)
+        # Parse options
+        FORCE_SEND=""
+        WAIT_FOR_PROMPT=""
+        POSITIONAL=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --force|-f)
+                    FORCE_SEND=1
+                    shift
+                    ;;
+                --wait|-w)
+                    WAIT_FOR_PROMPT=1
+                    shift
+                    ;;
+                *)
+                    POSITIONAL+=("$1")
+                    shift
+                    ;;
+            esac
+        done
+        set -- "${POSITIONAL[@]}"
+
         if [ -z "$1" ] || [ -z "$2" ]; then
-            echo "Usage: shuttle send <number|name> <message>"
+            echo "Usage: shuttle send [--force] [--wait] <number|name> <message>"
+            echo "  --force, -f   Send even if session is not at prompt"
+            echo "  --wait, -w    Wait for prompt before sending (up to 30s)"
             exit 1
         fi
 
@@ -358,17 +383,105 @@ case "$CMD" in
             exit 1
         fi
 
+        # Check session state before sending
+        NOW=$(date +%s)
+        ACTIVITY=$(tmux list-sessions -F '#{session_name}|#{session_activity}' 2>/dev/null | grep -F "$SESSION|" | cut -d'|' -f2)
+        IDLE=$((NOW - ACTIVITY))
+        STATE=$(detect_session_state "$SESSION" "$IDLE")
+
+        if [ -n "$WAIT_FOR_PROMPT" ]; then
+            # Wait for session to reach prompt state (use configured timeout)
+            WAIT_ITERATIONS=$((SHUTTLE_PROMPT_TIMEOUT * 2))  # 2 checks per second
+            echo "Waiting for $SESSION to reach prompt..."
+            for ((i=1; i<=WAIT_ITERATIONS; i++)); do
+                NOW=$(date +%s)
+                ACTIVITY=$(tmux list-sessions -F '#{session_name}|#{session_activity}' 2>/dev/null | grep -F "$SESSION|" | cut -d'|' -f2)
+                # Detect session disappearance
+                if [ -z "$ACTIVITY" ]; then
+                    echo "Error: Session '$SESSION' no longer exists"
+                    exit 1
+                fi
+                IDLE=$((NOW - ACTIVITY))
+                STATE=$(detect_session_state "$SESSION" "$IDLE")
+                if [ "$STATE" = "waiting" ]; then
+                    break
+                fi
+                sleep 0.5
+            done
+            if [ "$STATE" != "waiting" ]; then
+                echo "Warning: Timed out waiting for prompt (state: $STATE)"
+                if [ -z "$FORCE_SEND" ]; then
+                    echo "Use --force to send anyway"
+                    exit 1
+                fi
+            fi
+        fi
+
+        # Warn if not at prompt (unless forced)
+        if [ "$STATE" != "waiting" ] && [ -z "$FORCE_SEND" ]; then
+            INDICATOR=$(format_state "$STATE")
+            echo "Warning: Session is not at prompt ($INDICATOR $STATE)"
+            case "$STATE" in
+                working)
+                    echo "  Claude is currently processing. The message may be ignored."
+                    ;;
+                approval)
+                    echo "  Session is waiting for approval. Send may interact with the approval prompt."
+                    ;;
+                stuck)
+                    echo "  Session appears stuck. The message may not be received."
+                    ;;
+            esac
+            echo "Use --force to send anyway, or --wait to wait for prompt"
+            exit 1
+        fi
+
         echo "Sending to $SESSION: $MESSAGE"
         tmux_send_cmd "$SESSION" "$MESSAGE"
+
+        # Brief verification that something happened
+        sleep 0.3
+        NEW_STATE=$(detect_session_state "$SESSION" 0)
+        case "$NEW_STATE" in
+            working)
+                echo "✓ Claude is processing your message"
+                ;;
+            waiting)
+                if [ "$STATE" = "waiting" ]; then
+                    echo "Note: Session still at prompt - message may not have been accepted"
+                else
+                    echo "✓ Message sent, session now at prompt"
+                fi
+                ;;
+            approval)
+                echo "Note: Session is now awaiting approval"
+                ;;
+            stuck)
+                echo "Warning: Session appears stuck after send"
+                ;;
+            unknown)
+                echo "Note: Could not determine session state after send"
+                ;;
+        esac
         ;;
 
     relay)
         NO_ENTER=""
+        FORCE_SEND=""
+        WAIT_FOR_PROMPT=""
         POSITIONAL=()
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 --no-enter|-n)
                     NO_ENTER=1
+                    shift
+                    ;;
+                --force|-f)
+                    FORCE_SEND=1
+                    shift
+                    ;;
+                --wait|-w)
+                    WAIT_FOR_PROMPT=1
                     shift
                     ;;
                 *)
@@ -380,8 +493,10 @@ case "$CMD" in
         set -- "${POSITIONAL[@]}"
 
         if [ -z "$1" ] || [ -z "$2" ]; then
-            echo "Usage: shuttle relay [--no-enter] <number|name> <file|->"
+            echo "Usage: shuttle relay [options] <number|name> <file|->"
             echo "  --no-enter, -n  Paste without pressing Enter"
+            echo "  --force, -f     Send even if session is not at prompt"
+            echo "  --wait, -w      Wait for prompt before sending (up to 30s)"
             echo "  Use '-' to read from stdin"
             exit 1
         fi
@@ -414,6 +529,48 @@ case "$CMD" in
         SIZE=${#CONTENT}
         if [ "$SIZE" -gt 10240 ]; then
             echo "Warning: Large content ($SIZE bytes) - may be slow"
+        fi
+
+        # Check session state before sending
+        NOW=$(date +%s)
+        ACTIVITY=$(tmux list-sessions -F '#{session_name}|#{session_activity}' 2>/dev/null | grep -F "$SESSION|" | cut -d'|' -f2)
+        IDLE=$((NOW - ACTIVITY))
+        STATE=$(detect_session_state "$SESSION" "$IDLE")
+
+        if [ -n "$WAIT_FOR_PROMPT" ]; then
+            # Wait for session to reach prompt state (use configured timeout)
+            WAIT_ITERATIONS=$((SHUTTLE_PROMPT_TIMEOUT * 2))  # 2 checks per second
+            echo "Waiting for $SESSION to reach prompt..."
+            for ((i=1; i<=WAIT_ITERATIONS; i++)); do
+                NOW=$(date +%s)
+                ACTIVITY=$(tmux list-sessions -F '#{session_name}|#{session_activity}' 2>/dev/null | grep -F "$SESSION|" | cut -d'|' -f2)
+                # Detect session disappearance
+                if [ -z "$ACTIVITY" ]; then
+                    echo "Error: Session '$SESSION' no longer exists"
+                    exit 1
+                fi
+                IDLE=$((NOW - ACTIVITY))
+                STATE=$(detect_session_state "$SESSION" "$IDLE")
+                if [ "$STATE" = "waiting" ]; then
+                    break
+                fi
+                sleep 0.5
+            done
+            if [ "$STATE" != "waiting" ]; then
+                echo "Warning: Timed out waiting for prompt (state: $STATE)"
+                if [ -z "$FORCE_SEND" ]; then
+                    echo "Use --force to send anyway"
+                    exit 1
+                fi
+            fi
+        fi
+
+        # Warn if not at prompt (unless forced)
+        if [ "$STATE" != "waiting" ] && [ -z "$FORCE_SEND" ]; then
+            INDICATOR=$(format_state "$STATE")
+            echo "Warning: Session is not at prompt ($INDICATOR $STATE)"
+            echo "Use --force to send anyway, or --wait to wait for prompt"
+            exit 1
         fi
 
         echo "Relaying to $SESSION ($SIZE bytes)..."
@@ -1454,8 +1611,8 @@ Commands:
   search <query>  Search CC session history (uses index)
   resume <id>     Resume a past CC session by UUID
   export, x <n|id>  Export session to markdown or JSON
-  send <n> <msg>  Send message to session
-  relay <n> <file>  Send file contents to session (use '-' for stdin)
+  send <n> <msg>  Send message to session (checks state first)
+  relay <n> <file>  Send file contents to session (checks state, use '-' for stdin)
   go, g <brief>   Launch new session on a brief
   split, s <brief>   Open brief in horizontal split pane
   vsplit, vs <brief> Open brief in vertical split pane
@@ -1473,6 +1630,13 @@ Search options:
   --since, -s N    Only sessions from last N days
   --project, -p P  Filter by project path (substring match)
   --limit, -n N    Limit results (default: 20)
+
+Send/relay options:
+  --force, -f      Send even if session is not at prompt
+  --wait, -w       Wait for session to reach prompt (up to 30s)
+
+Relay options:
+  --no-enter, -n   Paste without pressing Enter
 
 Options (for go, board, split, vsplit):
   -d, --dir PATH      Run in specified directory (go, split, vsplit)
