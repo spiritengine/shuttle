@@ -1608,6 +1608,45 @@ EXAMPLE
         fi
         ;;
 
+    whoami)
+        # Generate and print a unique probe string for session identification
+        # This allows agents to discover their own session ID by:
+        # 1. Running `shuttle whoami` to get a unique probe
+        # 2. Running `shuttle confirm <probe>` from outside to find the session
+        PROBE="SESSION_PROBE_$(head -c 12 /dev/urandom | base64 | tr -d '/+=' | head -c 16)"
+        echo "$PROBE"
+        ;;
+
+    confirm)
+        # Find which CC session contains the probe string
+        # Returns the session ID if found
+        if [ -z "$1" ]; then
+            echo "Usage: shuttle confirm <probe-string>"
+            echo "  Find which CC session contains the probe (from 'shuttle whoami')"
+            exit 1
+        fi
+
+        PROBE="$1"
+        CC_PROJECTS="$HOME/.claude/projects"
+
+        # Validate probe format (should start with SESSION_PROBE_)
+        if [[ ! "$PROBE" =~ ^SESSION_PROBE_ ]]; then
+            echo "Warning: Probe doesn't match expected format (SESSION_PROBE_*)"
+        fi
+
+        # Search all session files for the probe, excluding agent files
+        MATCH_FILE=$(grep -r -l "$PROBE" "$CC_PROJECTS" 2>/dev/null | grep '\.jsonl$' | grep -v '/agent-' | head -1)
+
+        if [ -z "$MATCH_FILE" ]; then
+            echo "Probe not found in any session"
+            exit 1
+        fi
+
+        # Extract session ID from filename
+        SESSION_ID=$(basename "$MATCH_FILE" .jsonl)
+        echo "$SESSION_ID"
+        ;;
+
     help|--help|-h)
         cat << 'EOF'
 shuttle - Manage Claude Code agent sessions
@@ -1627,6 +1666,8 @@ Commands:
   export, x <n|id>  Export session to markdown or JSON
   send <n> <msg>  Send message to session (checks state first)
   relay <n> <file>  Send file contents to session (checks state, use '-' for stdin)
+  whoami          Print unique probe string for session identification
+  confirm <probe> Find session ID containing the probe string
   go, g <brief>   Launch new session on a brief
   split, s <brief>   Open brief in horizontal split pane
   vsplit, vs <brief> Open brief in vertical split pane
@@ -1695,6 +1736,8 @@ Examples:
   shuttle export 1 --json --file out.json  # export to JSON file
   shuttle send 1 "check the failing tests"  # nudge a session
   shuttle send 2 "skein torch"  # trigger retirement
+  shuttle whoami              # get unique probe (run from inside session)
+  shuttle confirm SESSION_PROBE_abc123  # find session containing probe
   shuttle kill diverge        # kill session matching 'diverge'
 EOF
         ;;
