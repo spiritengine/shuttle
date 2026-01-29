@@ -17,6 +17,8 @@ shuttle tail <n>     # live output stream (Ctrl-C to exit)
 shuttle send <n> <msg>  # send message to session
 shuttle relay <n> <file>  # send file contents to session
 shuttle context <n>  # show conversation context from CC history
+shuttle whoami       # print unique probe for session identification
+shuttle confirm <p>  # find session ID containing probe
 shuttle index        # build session index for fast search
 shuttle index -u     # incremental update (fast, ~8s)
 shuttle search -l -a # list all sessions from index
