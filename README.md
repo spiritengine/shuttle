@@ -75,7 +75,15 @@ for pair in session.tool_pairs():
 **Testing:**
 ```bash
 cd ~/projects/shuttle
+
+# Quick import test
 python3 -c "from parser import load; s = load('test.jsonl'); print(s.total_tokens())"
+
+# Full test suite (requires session files)
+# Copy from compress repo for full tests:
+# cp ~/projects/spiritengine/compress/sessions/*.jsonl sessions/
+pytest parser/test_parser.py -v
+# 74 tests total (64 pass without session files, 74 with)
 ```
 
 ## Related
