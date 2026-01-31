@@ -46,6 +46,38 @@ shuttle ground
 - Names sessions based on brief titles for easy identification
 - Reboards existing sessions instead of creating duplicates
 
+## Parser
+
+Shuttle uses the lazarus parser from spiritengine/compress for robust JSONL session parsing.
+
+**Location:** `parser/` (vendored copy)
+**Source:** `~/projects/spiritengine/compress/parser/`
+**Last synced:** 2026-01-30
+**Tests:** 88 tests, property-based testing
+
+The parser provides:
+- Round-trip faithful JSONL parsing
+- Type-safe models (Event, Message, ToolPair, Session)
+- Token counting, message reconstruction
+- Tool use/result matching
+
+**Usage:**
+```python
+from parser import load, Session
+
+session = Session.from_path("session.jsonl")
+print(f"{len(session.events)} events, {session.total_tokens()} tokens")
+
+for pair in session.tool_pairs():
+    print(f"{pair.tool_name}: {pair.result_size} chars")
+```
+
+**Testing:**
+```bash
+cd ~/projects/shuttle
+python3 -c "from parser import load; s = load('test.jsonl'); print(s.total_tokens())"
+```
+
 ## Related
 
 - **SKEIN** - Knowledge management, briefs, folios

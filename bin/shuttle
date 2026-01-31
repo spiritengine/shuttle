@@ -139,7 +139,7 @@ launch_terminal() {
     fi
 }
 
-# Format seconds as relative time (e.g., "2m ago", "1h ago")
+# Format seconds as relative time with minutes precision (e.g., "2m", "3h 42m")
 format_age() {
     local seconds=$1
     if [ "$seconds" -lt 60 ]; then
@@ -147,7 +147,13 @@ format_age() {
     elif [ "$seconds" -lt 3600 ]; then
         echo "$((seconds / 60))m"
     elif [ "$seconds" -lt 86400 ]; then
-        echo "$((seconds / 3600))h"
+        local hours=$((seconds / 3600))
+        local mins=$(((seconds % 3600) / 60))
+        if [ "$mins" -eq 0 ]; then
+            echo "${hours}h"
+        else
+            echo "${hours}h ${mins}m"
+        fi
     else
         echo "$((seconds / 86400))d"
     fi

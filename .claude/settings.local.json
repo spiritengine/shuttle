@@ -23,7 +23,12 @@
       "Bash(SKEIN_AGENT_ID=prime skein post brief shuttle --title \"Robust CC session index for agentology\" \"$(cat <<''EOF''\n## Context\nCC stores sessions in `~/.claude/projects/{path}/*.jsonl`. Currently `shuttle search` does live grep which is slow for large history. A proper index would enable:\n- Fast search across all sessions\n- Metadata queries (by date, project, duration)\n- Foundation for semantic search later\n\n## Proposed Solution\nBuild and maintain a session index:\n\n### Index Storage\n`~/.shuttle/index.json` or SQLite:\n```json\n{\n  \"sessions\": {\n    \"uuid-1\": {\n      \"project\": \"/home/patrick/projects/foo\",\n      \"started\": \"2025-12-15T10:00:00Z\",\n      \"last_activity\": \"2025-12-15T12:00:00Z\",\n      \"message_count\": 45,\n      \"summary\": \"Working on auth system...\",\n      \"tags\": [\"auth\", \"backend\"]\n    }\n  }\n}\n```\n\n### Commands\n- `shuttle index` - rebuild full index\n- `shuttle index --update` - incremental update (new/modified files)\n- Search uses index instead of live grep\n\n### Future: Semantic Search\nWith index in place, could add:\n- Embeddings for each session (summary or full text)\n- Vector similarity search\n- \"Find sessions like this one\"\n\n## Use Cases\n- Fast search across months of sessions\n- \"What was I working on last Tuesday?\"\n- Mining patterns across agent conversations\n- Building agentology corpus\n\n## Acceptance\n- Index builds in reasonable time\n- Search is noticeably faster\n- Index updates incrementally\nEOF\n)\")",
       "Bash(SKEIN_AGENT_ID=prime skein post:*)",
       "mcp__spindle__spin_wait",
-      "Bash(tmux ls:*)"
+      "Bash(tmux ls:*)",
+      "Bash(horizon health)",
+      "Bash(horizon cast:*)",
+      "Bash(time ./bin/shuttle index:*)",
+      "Bash(xsel:*)",
+      "Bash(tmux show-options:*)"
     ]
   },
   "outputStyle": "Explanatory",
