@@ -1696,6 +1696,23 @@ Send/relay options:
   --force, -f      Send even if session is not at prompt
   --wait, -w       Wait for session to reach prompt (up to 30s)
 
+Targeting sessions:
+  Most commands accept <number|name> for targeting sessions.
+
+  <number>  Positional index from 'shuttle' output (e.g., 1, 2, 3)
+            WARNING: These shift when sessions exit. Not safe for automation.
+
+  <name>    Session name (e.g., cc-speakbot-997451, shuttle-my-task)
+            Stable identifier that doesn't change. Recommended for watchman/automation.
+
+  Race condition example:
+    shuttle peek 3        # See session 3 needs approval
+    # Session 2 exits here - numbers shift!
+    shuttle send 3 "y"    # Now sends to WRONG session (was #4)
+
+  Safe approach for automation:
+    shuttle send cc-speakbot-997451 "y"   # Use full session name
+
 Relay options:
   --no-enter, -n   Paste without pressing Enter
 
