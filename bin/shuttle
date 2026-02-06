@@ -1208,10 +1208,30 @@ $CONTENT
         BRIEF_ID="$1"
 
         # Get brief title for human-readable session name
-        # Use pwd for SKEIN lookup (brief lives where user is), not SHUTTLE_DEFAULT_PROJECT
-        BRIEF_TITLE=$(SKEIN_PROJECT="$(pwd)" skein folio "$BRIEF_ID" 2>/dev/null | grep "^    #" | head -1 | sed 's/^[[:space:]]*#[[:space:]]*//' | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g' | sed 's/--*/-/g' | cut -c1-25)
+        # Try current directory first (SKEIN auto-detects project from pwd)
+        BRIEF_TITLE=$(skein folio "$BRIEF_ID" 2>/dev/null | grep "^    #" | head -1 | sed 's/^[[:space:]]*#[[:space:]]*//' | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g' | sed 's/--*/-/g' | cut -c1-25)
 
+        # If not found in current project, search other registered projects
         if [ -z "$BRIEF_TITLE" ]; then
+            FOUND_PROJECT=""
+            # Get list of registered projects from SKEIN
+            if [ -f ~/.skein/projects.json ]; then
+                for PROJECT_NAME in $(jq -r '.projects | keys[]' ~/.skein/projects.json 2>/dev/null); do
+                    if SKEIN_PROJECT="$PROJECT_NAME" skein folio "$BRIEF_ID" 2>/dev/null | grep -q "^    #"; then
+                        FOUND_PROJECT="$PROJECT_NAME"
+                        break
+                    fi
+                done
+            fi
+
+            if [ -n "$FOUND_PROJECT" ]; then
+                echo "Brief not found in current project."
+                echo "Found in: $FOUND_PROJECT"
+                echo "Run: shuttle go -p $FOUND_PROJECT $BRIEF_ID"
+                exit 1
+            fi
+
+            # Not found anywhere, use brief ID as session name
             SESSION="shuttle-${BRIEF_ID}"
         else
             SESSION="shuttle-${BRIEF_TITLE}"
