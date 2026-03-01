@@ -62,6 +62,7 @@ _INJECTION_PREFIXES = (
     "<bash-stderr>",
     "<system-reminder>",
     "<function_calls>",
+    "<user-prompt-submit-hook>",
 )
 
 
