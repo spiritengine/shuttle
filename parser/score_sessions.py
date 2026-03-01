@@ -16,7 +16,6 @@ Options:
     --project, -p PROJECT   Filter by project name (substring)
     --since, -s DAYS        Only sessions from last N days
     --limit, -n N           Limit results (default: 20)
-    --all, -a               All projects (default: filter to cwd project)
     --json, -j              JSON output
     --min-score M           Only sessions scoring at or above M (0-100)
     --include-automated     Include automated sessions (default: interactive only)
@@ -29,7 +28,7 @@ import argparse
 import json
 import math
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterator
@@ -37,12 +36,6 @@ from typing import Iterator
 
 # Tools that indicate productive file-editing work
 EDIT_TOOLS = frozenset({"Write", "Edit", "NotebookEdit", "MultiEdit"})
-
-# Tools that are high-value signal (code/file work + search)
-SIGNAL_TOOLS = frozenset({
-    "Bash", "Read", "Write", "Edit", "Glob", "Grep",
-    "NotebookEdit", "MultiEdit", "WebFetch", "WebSearch",
-})
 
 # Patterns in the first user message that flag an automated session
 AUTOMATED_MARKERS = [
@@ -225,7 +218,6 @@ def score_session_file(path: Path) -> SessionScore | None:
         unique_tools=unique_tool_names,
         edit_tool_count=edit_tool_count,
         total_events=total_events,
-        duration_minutes=duration_minutes,
         is_interactive=is_interactive,
     )
 
@@ -267,7 +259,6 @@ def _compute_score(
     unique_tools: set[str],
     edit_tool_count: int,
     total_events: int,
-    duration_minutes: float | None,
     is_interactive: bool,
 ) -> float:
     """Compute a signal density score (raw, pre-normalization).
@@ -364,10 +355,11 @@ def walk_session_files(
         if not project_dir.is_dir():
             continue
 
-        # Apply project filter (on decoded path)
+        # Apply project filter (on decoded path, with raw name fallback for hyphenated projects)
         if project_filter:
             decoded = _decode_project_path(project_dir.name)
-            if project_filter.lower() not in decoded.lower():
+            filter_lower = project_filter.lower()
+            if filter_lower not in decoded.lower() and filter_lower not in project_dir.name.lower():
                 continue
 
         for file in sorted(project_dir.glob("*.jsonl")):
@@ -397,7 +389,7 @@ def score_sessions(
         project_filter: Substring match on project path.
         since_days: Only sessions modified in last N days.
         interactive_only: If True, only return interactive sessions.
-        min_score: Only return sessions scoring >= this (0-100, pre-normalization).
+        min_score: Only return sessions scoring >= this (0-100, post-normalization).
         limit: Maximum number of sessions to return.
         verbose: Print progress to stderr.
 
@@ -406,7 +398,6 @@ def score_sessions(
     """
     sessions: list[SessionScore] = []
     total_scanned = 0
-    total_skipped = 0
 
     for path in walk_session_files(project_filter=project_filter, since_days=since_days):
         total_scanned += 1
@@ -415,7 +406,6 @@ def score_sessions(
 
         scored = score_session_file(path)
         if scored is None:
-            total_skipped += 1
             continue
 
         if interactive_only and not scored.is_interactive:
@@ -545,11 +535,6 @@ Examples:
         default=20,
         metavar="N",
         help="Max sessions to show (default: 20)",
-    )
-    parser.add_argument(
-        "--all", "-a",
-        action="store_true",
-        help="All projects (default when --project not set)",
     )
     parser.add_argument(
         "--json", "-j",
