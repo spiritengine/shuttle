@@ -4,6 +4,9 @@
 
 set -e
 
+# Resolve the directory containing this script (for finding sibling modules)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -1681,6 +1684,17 @@ EXAMPLE
         echo "$SESSION_ID"
         ;;
 
+    score-sessions|score)
+        # Score and rank CC sessions by signal density
+        # Delegates to Python module for analysis
+        SCORE_SCRIPT="$SCRIPT_DIR/../parser/score_sessions.py"
+        if [ ! -f "$SCORE_SCRIPT" ]; then
+            echo "Error: score_sessions.py not found at $SCORE_SCRIPT"
+            exit 1
+        fi
+        exec python3 "$SCORE_SCRIPT" "$@"
+        ;;
+
     help|--help|-h)
         cat << 'EOF'
 shuttle - Manage Claude Code agent sessions
@@ -1703,6 +1717,7 @@ Commands:
   relay <n> <file>  Send file contents to session (checks state, use '-' for stdin)
   whoami          Print unique probe string for session identification
   confirm <probe> Find session ID containing the probe string
+  score-sessions  Score and rank sessions by signal density
   go, g <brief>   Launch new session on a brief
   split, s <brief>   Open brief in horizontal split pane
   vsplit, vs <brief> Open brief in vertical split pane
@@ -1800,6 +1815,9 @@ Examples:
   shuttle send 2 "skein torch"  # trigger retirement
   shuttle whoami              # get unique probe (run from inside session)
   shuttle confirm SESSION_PROBE_abc123  # find session containing probe
+  shuttle score-sessions               # top 20 interactive sessions by signal
+  shuttle score-sessions -p speakbot -s 7  # speakbot sessions, last 7 days
+  shuttle score-sessions --json        # output as JSON
   shuttle kill diverge        # kill session matching 'diverge'
 EOF
         ;;
