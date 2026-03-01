@@ -218,6 +218,8 @@ class Event:
         """Whether this event participates in the API conversation."""
         if self.is_sidechain:
             return False
+        if self.is_meta:
+            return False
         if self.type in ("progress", "system", "queue-operation"):
             return False
         return True

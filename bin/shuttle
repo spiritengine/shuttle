@@ -1698,6 +1698,7 @@ Commands:
   search <query>  Search CC session history (uses index)
   resume <id>     Resume a past CC session by UUID
   export, x <n|id>  Export session to markdown or JSON
+  extract-pairs, ep  Extract training pairs from CC sessions
   send <n> <msg>  Send message to session (checks state first)
   relay <n> <file>  Send file contents to session (checks state, use '-' for stdin)
   whoami          Print unique probe string for session identification
@@ -1766,6 +1767,14 @@ Export options:
   --file, -f FILE   Write to file instead of stdout
   --last, -l N      Only include last N messages
 
+Extract-pairs options:
+  --all, -a         Walk all CC sessions (~/.claude/projects/)
+  --project, -p P   Filter sessions by project name
+  --since, -s N     Only sessions from last N days
+  --output, -o FILE Write JSONL to file (default: stdout)
+  --min-context N   Min context turns before emitting pair (default: 1)
+  --stats           Show statistics instead of JSONL output
+
 Examples:
   shuttle                     # show status
   shuttle config              # show configuration
@@ -1785,12 +1794,25 @@ Examples:
   shuttle tail 2 0.5          # faster refresh (0.5s interval)
   shuttle export 1            # export session 1 as markdown
   shuttle export 1 --json --file out.json  # export to JSON file
+  shuttle extract-pairs --all --output pairs.jsonl  # training data from all sessions
+  shuttle extract-pairs --project shuttle --stats   # stats for shuttle sessions
   shuttle send 1 "check the failing tests"  # nudge a session
   shuttle send 2 "skein torch"  # trigger retirement
   shuttle whoami              # get unique probe (run from inside session)
   shuttle confirm SESSION_PROBE_abc123  # find session containing probe
   shuttle kill diverge        # kill session matching 'diverge'
 EOF
+        ;;
+
+    extract-pairs|ep)
+        # Extract (context, response) training pairs from CC session JSONL files
+        SHUTTLE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+        exec python3 -c "
+import sys
+sys.path.insert(0, '$SHUTTLE_ROOT')
+from parser.extract_pairs import main
+sys.exit(main(sys.argv[1:]))
+" "$@"
         ;;
 
     *)
