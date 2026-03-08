@@ -1362,23 +1362,25 @@ $CONTENT
             fi
             if echo "$BRIEF_CHECK" | grep -q "^folio $BRIEF_ID"; then
                 BRIEF_FOUND=1
-            elif [ -f ~/.skein/projects.json ]; then
+            else
                 FOUND_PROJECT=""
                 FOUND_PROJECT_DIR=""
-                for SEARCH_PROJECT in $(jq -r '.projects | keys[]' ~/.skein/projects.json 2>/dev/null); do
-                    if SKEIN_PROJECT="$SEARCH_PROJECT" skein folio "$BRIEF_ID" 2>/dev/null | grep -q "^folio $BRIEF_ID"; then
-                        FOUND_PROJECT="$SEARCH_PROJECT"
-                        FOUND_PROJECT_DIR=$(jq -r ".projects[\"$SEARCH_PROJECT\"].path // empty" ~/.skein/projects.json 2>/dev/null)
-                        break
-                    fi
-                done
+                if [ -f ~/.skein/projects.json ]; then
+                    for SEARCH_PROJECT in $(jq -r '.projects | keys[]' ~/.skein/projects.json 2>/dev/null); do
+                        if SKEIN_PROJECT="$SEARCH_PROJECT" skein folio "$BRIEF_ID" 2>/dev/null | grep -q "^folio $BRIEF_ID"; then
+                            FOUND_PROJECT="$SEARCH_PROJECT"
+                            FOUND_PROJECT_DIR=$(jq -r ".projects[\"$SEARCH_PROJECT\"].path // empty" ~/.skein/projects.json 2>/dev/null)
+                            break
+                        fi
+                    done
+                fi
                 if [ -n "$FOUND_PROJECT" ] && [ -n "$FOUND_PROJECT_DIR" ] && [ -d "$FOUND_PROJECT_DIR" ]; then
                     echo "Brief found in: $FOUND_PROJECT ($FOUND_PROJECT_DIR)"
                     PROJECT_DIR="$FOUND_PROJECT_DIR"
                     BRIEF_FOUND=1
                 elif [ -n "$FOUND_PROJECT" ]; then
                     echo "Brief belongs to project '$FOUND_PROJECT' but its path could not be resolved."
-                    echo "Use: shuttle go -p $FOUND_PROJECT $BRIEF_ID"
+                    echo "Use: shuttle $CMD -p $FOUND_PROJECT $BRIEF_ID"
                     exit 1
                 else
                     echo "Brief not found: $BRIEF_ID"
