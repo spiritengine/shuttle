@@ -61,6 +61,7 @@ load_config
 parse_project_opts() {
     PROJECT_DIR=""
     PROJECT_NAME=""
+    EXPLICIT_DIR=""
     HEADLESS=""
     POSITIONAL=()
 
@@ -68,6 +69,7 @@ parse_project_opts() {
         case "$1" in
             -d|--dir)
                 PROJECT_DIR="$2"
+                EXPLICIT_DIR=1
                 shift 2
                 ;;
             -p|--project)
@@ -1219,7 +1221,8 @@ $CONTENT
         fi
 
         # If not found in current project, search other registered projects
-        if [ -z "$BRIEF_TITLE" ]; then
+        # Skip cross-project search if user explicitly set a directory with -d
+        if [ -z "$BRIEF_TITLE" ] && [ -z "$EXPLICIT_DIR" ]; then
             FOUND_PROJECT=""
             FOUND_PROJECT_DIR=""
             # Get list of registered projects from SKEIN
@@ -1250,6 +1253,9 @@ $CONTENT
                 echo "Not found in current project or any registered SKEIN project."
                 exit 1
             fi
+        elif [ -z "$BRIEF_TITLE" ]; then
+            # -d was explicit but brief not found — use brief ID as session name
+            SESSION="shuttle-${BRIEF_ID}"
         else
             SESSION="shuttle-${BRIEF_TITLE}"
         fi
