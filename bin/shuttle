@@ -134,13 +134,26 @@ tmux_send_cmd() {
 }
 
 # Launch terminal with given command
-# Uses configured SHUTTLE_TERMINAL, with dbus-launch wrapper for gnome-terminal
 launch_terminal() {
     local cmd="$1"
-    if [[ "$SHUTTLE_TERMINAL" == gnome-terminal* ]]; then
-        dbus-launch $SHUTTLE_TERMINAL $cmd 2>/dev/null
+    local errfile
+    errfile=$(mktemp /tmp/shuttle-term-XXXXXX)
+
+    $SHUTTLE_TERMINAL $cmd 2>"$errfile"
+    local rc=$?
+
+    if [ $rc -ne 0 ] || [ -s "$errfile" ]; then
+        local errors
+        errors=$(cat "$errfile")
+        rm -f "$errfile"
+        # Only warn on real errors, not GTK noise
+        if echo "$errors" | grep -qiE "error|failed|cannot"; then
+            echo "Warning: terminal launch may have failed:"
+            echo "  $errors"
+            echo "Session is still running in tmux — attach manually"
+        fi
     else
-        $SHUTTLE_TERMINAL $cmd 2>/dev/null
+        rm -f "$errfile"
     fi
 }
 
@@ -1331,6 +1344,28 @@ $CONTENT
         fi
 
         BRIEF_ID="$1"
+
+        # Cross-project resolution (same logic as 'go')
+        if [ -z "$EXPLICIT_DIR" ]; then
+            if [ -n "$PROJECT_NAME" ]; then
+                BRIEF_CHECK=$(SKEIN_PROJECT="$PROJECT_NAME" skein folio "$BRIEF_ID" 2>/dev/null | grep "^    #")
+            else
+                BRIEF_CHECK=$(skein folio "$BRIEF_ID" 2>/dev/null | grep "^    #")
+            fi
+            if [ -z "$BRIEF_CHECK" ] && [ -f ~/.skein/projects.json ]; then
+                for SEARCH_PROJECT in $(jq -r '.projects | keys[]' ~/.skein/projects.json 2>/dev/null); do
+                    if SKEIN_PROJECT="$SEARCH_PROJECT" skein folio "$BRIEF_ID" 2>/dev/null | grep -q "^    #"; then
+                        FOUND_PROJECT_DIR=$(jq -r ".projects[\"$SEARCH_PROJECT\"].path // empty" ~/.skein/projects.json 2>/dev/null)
+                        if [ -n "$FOUND_PROJECT_DIR" ] && [ -d "$FOUND_PROJECT_DIR" ]; then
+                            echo "Brief found in: $SEARCH_PROJECT ($FOUND_PROJECT_DIR)"
+                            PROJECT_DIR="$FOUND_PROJECT_DIR"
+                        fi
+                        break
+                    fi
+                done
+            fi
+        fi
+
         echo "Opening $SPLIT_TYPE split for $BRIEF_ID (in $PROJECT_DIR)..."
 
         # Create split running claude, capture the new pane ID
