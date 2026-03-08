@@ -1225,25 +1225,33 @@ $CONTENT
         fi
         BRIEF_ID="$1"
 
-        # Get brief title for human-readable session name
+        # Check if brief exists and extract title for session name
         # Use explicit project if -p was provided, otherwise SKEIN auto-detects from pwd
         if [ -n "$PROJECT_NAME" ]; then
-            BRIEF_TITLE=$(SKEIN_PROJECT="$PROJECT_NAME" skein folio "$BRIEF_ID" 2>/dev/null | grep "^    #" | head -1 | sed 's/^[[:space:]]*#[[:space:]]*//' | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g' | sed 's/--*/-/g' | cut -c1-25)
+            BRIEF_OUTPUT=$(SKEIN_PROJECT="$PROJECT_NAME" skein folio "$BRIEF_ID" 2>/dev/null)
         else
-            BRIEF_TITLE=$(skein folio "$BRIEF_ID" 2>/dev/null | grep "^    #" | head -1 | sed 's/^[[:space:]]*#[[:space:]]*//' | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g' | sed 's/--*/-/g' | cut -c1-25)
+            BRIEF_OUTPUT=$(skein folio "$BRIEF_ID" 2>/dev/null)
+        fi
+        BRIEF_FOUND=""
+        BRIEF_TITLE=""
+        if echo "$BRIEF_OUTPUT" | grep -q "^folio $BRIEF_ID"; then
+            BRIEF_FOUND=1
+            BRIEF_TITLE=$(echo "$BRIEF_OUTPUT" | grep "^    #" | head -1 | sed 's/^[[:space:]]*#[[:space:]]*//' | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g' | sed 's/--*/-/g' | cut -c1-25)
         fi
 
         # If not found in current project, search other registered projects
         # Skip cross-project search if user explicitly set a directory with -d
-        if [ -z "$BRIEF_TITLE" ] && [ -z "$EXPLICIT_DIR" ]; then
+        if [ -z "$BRIEF_FOUND" ] && [ -z "$EXPLICIT_DIR" ]; then
             FOUND_PROJECT=""
             FOUND_PROJECT_DIR=""
             # Get list of registered projects from SKEIN
             if [ -f ~/.skein/projects.json ]; then
                 for SEARCH_PROJECT in $(jq -r '.projects | keys[]' ~/.skein/projects.json 2>/dev/null); do
-                    if SKEIN_PROJECT="$SEARCH_PROJECT" skein folio "$BRIEF_ID" 2>/dev/null | grep -q "^    #"; then
+                    SEARCH_OUTPUT=$(SKEIN_PROJECT="$SEARCH_PROJECT" skein folio "$BRIEF_ID" 2>/dev/null)
+                    if echo "$SEARCH_OUTPUT" | grep -q "^folio $BRIEF_ID"; then
                         FOUND_PROJECT="$SEARCH_PROJECT"
                         FOUND_PROJECT_DIR=$(jq -r ".projects[\"$SEARCH_PROJECT\"].path // empty" ~/.skein/projects.json 2>/dev/null)
+                        BRIEF_TITLE=$(echo "$SEARCH_OUTPUT" | grep "^    #" | head -1 | sed 's/^[[:space:]]*#[[:space:]]*//' | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g' | sed 's/--*/-/g' | cut -c1-25)
                         break
                     fi
                 done
@@ -1253,7 +1261,6 @@ $CONTENT
                 # Auto-resolve: switch to the project that owns this brief
                 echo "Brief found in: $FOUND_PROJECT ($FOUND_PROJECT_DIR)"
                 PROJECT_DIR="$FOUND_PROJECT_DIR"
-                BRIEF_TITLE=$(SKEIN_PROJECT="$FOUND_PROJECT" skein folio "$BRIEF_ID" 2>/dev/null | grep "^    #" | head -1 | sed 's/^[[:space:]]*#[[:space:]]*//' | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g' | sed 's/--*/-/g' | cut -c1-25)
                 SESSION="shuttle-${BRIEF_TITLE:-$BRIEF_ID}"
             elif [ -n "$FOUND_PROJECT" ]; then
                 # Found in SKEIN but can't resolve directory
@@ -1348,13 +1355,13 @@ $CONTENT
         # Cross-project resolution (same logic as 'go')
         if [ -z "$EXPLICIT_DIR" ]; then
             if [ -n "$PROJECT_NAME" ]; then
-                BRIEF_CHECK=$(SKEIN_PROJECT="$PROJECT_NAME" skein folio "$BRIEF_ID" 2>/dev/null | grep "^    #")
+                BRIEF_CHECK=$(SKEIN_PROJECT="$PROJECT_NAME" skein folio "$BRIEF_ID" 2>/dev/null)
             else
-                BRIEF_CHECK=$(skein folio "$BRIEF_ID" 2>/dev/null | grep "^    #")
+                BRIEF_CHECK=$(skein folio "$BRIEF_ID" 2>/dev/null)
             fi
-            if [ -z "$BRIEF_CHECK" ] && [ -f ~/.skein/projects.json ]; then
+            if ! echo "$BRIEF_CHECK" | grep -q "^folio $BRIEF_ID" && [ -f ~/.skein/projects.json ]; then
                 for SEARCH_PROJECT in $(jq -r '.projects | keys[]' ~/.skein/projects.json 2>/dev/null); do
-                    if SKEIN_PROJECT="$SEARCH_PROJECT" skein folio "$BRIEF_ID" 2>/dev/null | grep -q "^    #"; then
+                    if SKEIN_PROJECT="$SEARCH_PROJECT" skein folio "$BRIEF_ID" 2>/dev/null | grep -q "^folio $BRIEF_ID"; then
                         FOUND_PROJECT_DIR=$(jq -r ".projects[\"$SEARCH_PROJECT\"].path // empty" ~/.skein/projects.json 2>/dev/null)
                         if [ -n "$FOUND_PROJECT_DIR" ] && [ -d "$FOUND_PROJECT_DIR" ]; then
                             echo "Brief found in: $SEARCH_PROJECT ($FOUND_PROJECT_DIR)"
