@@ -146,8 +146,8 @@ launch_terminal() {
         local errors
         errors=$(cat "$errfile")
         rm -f "$errfile"
-        # Only warn on real errors, not GTK noise
-        if echo "$errors" | grep -qiE "error|failed|cannot"; then
+        # Only warn on real errors, not GTK noise or fallback messages
+        if echo "$errors" | grep -qiE "error|failed|cannot" && ! echo "$errors" | grep -q "Falling back"; then
             echo "Warning: terminal launch may have failed:"
             echo "  $errors"
             echo "Session is still running in tmux — attach manually"
