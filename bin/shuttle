@@ -1211,8 +1211,12 @@ $CONTENT
         BRIEF_ID="$1"
 
         # Get brief title for human-readable session name
-        # Try current directory first (SKEIN auto-detects project from pwd)
-        BRIEF_TITLE=$(skein folio "$BRIEF_ID" 2>/dev/null | grep "^    #" | head -1 | sed 's/^[[:space:]]*#[[:space:]]*//' | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g' | sed 's/--*/-/g' | cut -c1-25)
+        # Use explicit project if -p was provided, otherwise SKEIN auto-detects from pwd
+        if [ -n "$PROJECT_NAME" ]; then
+            BRIEF_TITLE=$(SKEIN_PROJECT="$PROJECT_NAME" skein folio "$BRIEF_ID" 2>/dev/null | grep "^    #" | head -1 | sed 's/^[[:space:]]*#[[:space:]]*//' | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g' | sed 's/--*/-/g' | cut -c1-25)
+        else
+            BRIEF_TITLE=$(skein folio "$BRIEF_ID" 2>/dev/null | grep "^    #" | head -1 | sed 's/^[[:space:]]*#[[:space:]]*//' | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g' | sed 's/--*/-/g' | cut -c1-25)
+        fi
 
         # If not found in current project, search other registered projects
         if [ -z "$BRIEF_TITLE" ]; then
