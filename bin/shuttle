@@ -5,7 +5,7 @@
 set -e
 
 # Resolve the directory containing this script (for finding sibling modules)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
 # =============================================================================
 # Configuration
@@ -1217,25 +1217,35 @@ $CONTENT
         # If not found in current project, search other registered projects
         if [ -z "$BRIEF_TITLE" ]; then
             FOUND_PROJECT=""
+            FOUND_PROJECT_DIR=""
             # Get list of registered projects from SKEIN
             if [ -f ~/.skein/projects.json ]; then
-                for PROJECT_NAME in $(jq -r '.projects | keys[]' ~/.skein/projects.json 2>/dev/null); do
-                    if SKEIN_PROJECT="$PROJECT_NAME" skein folio "$BRIEF_ID" 2>/dev/null | grep -q "^    #"; then
-                        FOUND_PROJECT="$PROJECT_NAME"
+                for SEARCH_PROJECT in $(jq -r '.projects | keys[]' ~/.skein/projects.json 2>/dev/null); do
+                    if SKEIN_PROJECT="$SEARCH_PROJECT" skein folio "$BRIEF_ID" 2>/dev/null | grep -q "^    #"; then
+                        FOUND_PROJECT="$SEARCH_PROJECT"
+                        FOUND_PROJECT_DIR=$(jq -r ".projects[\"$SEARCH_PROJECT\"].path // empty" ~/.skein/projects.json 2>/dev/null)
                         break
                     fi
                 done
             fi
 
-            if [ -n "$FOUND_PROJECT" ]; then
-                echo "Brief not found in current project."
-                echo "Found in: $FOUND_PROJECT"
+            if [ -n "$FOUND_PROJECT" ] && [ -n "$FOUND_PROJECT_DIR" ] && [ -d "$FOUND_PROJECT_DIR" ]; then
+                # Auto-resolve: switch to the project that owns this brief
+                echo "Brief found in: $FOUND_PROJECT ($FOUND_PROJECT_DIR)"
+                PROJECT_DIR="$FOUND_PROJECT_DIR"
+                BRIEF_TITLE=$(SKEIN_PROJECT="$FOUND_PROJECT" skein folio "$BRIEF_ID" 2>/dev/null | grep "^    #" | head -1 | sed 's/^[[:space:]]*#[[:space:]]*//' | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g' | sed 's/--*/-/g' | cut -c1-25)
+                SESSION="shuttle-${BRIEF_TITLE:-$BRIEF_ID}"
+            elif [ -n "$FOUND_PROJECT" ]; then
+                # Found in SKEIN but can't resolve directory
+                echo "Brief belongs to project '$FOUND_PROJECT' but its path could not be resolved."
                 echo "Run: shuttle go -p $FOUND_PROJECT $BRIEF_ID"
                 exit 1
+            else
+                # Not found in any registered project
+                echo "Brief not found: $BRIEF_ID"
+                echo "Not found in current project or any registered SKEIN project."
+                exit 1
             fi
-
-            # Not found anywhere, use brief ID as session name
-            SESSION="shuttle-${BRIEF_ID}"
         else
             SESSION="shuttle-${BRIEF_TITLE}"
         fi
