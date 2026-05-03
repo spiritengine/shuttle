@@ -3,3 +3,4 @@ worktrees/
 parser/__pycache__/
 parser/.pytest_cache/
 sessions/
+.hypothesis/
