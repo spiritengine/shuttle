@@ -133,21 +133,71 @@ tmux_send_cmd() {
     tmux send-keys -t "$target" Enter
 }
 
+terminal_errors_are_dbus_stale() {
+    local errors="$1"
+    echo "$errors" | grep -qiE "screen|dbus|DBus|CreateInstance|Factory"
+}
+
+terminal_errors_need_warning() {
+    local errors="$1"
+    echo "$errors" | grep -qiE "error|failed|cannot" && ! echo "$errors" | grep -q "Falling back"
+}
+
+run_terminal_command() {
+    local terminal="$1"
+    local cmd="$2"
+    local errfile="$3"
+    local had_errexit=""
+
+    case "$-" in
+        *e*)
+            had_errexit=1
+            set +e
+            ;;
+    esac
+
+    $terminal $cmd 2>"$errfile"
+    local rc=$?
+
+    if [ -n "$had_errexit" ]; then
+        set -e
+    fi
+
+    return $rc
+}
+
 # Launch terminal with given command
 launch_terminal() {
     local cmd="$1"
     local errfile
     errfile=$(mktemp /tmp/shuttle-term-XXXXXX)
 
-    $SHUTTLE_TERMINAL $cmd 2>"$errfile"
+    run_terminal_command "$SHUTTLE_TERMINAL" "$cmd" "$errfile"
     local rc=$?
 
     if [ $rc -ne 0 ] || [ -s "$errfile" ]; then
         local errors
         errors=$(cat "$errfile")
+
+        if terminal_errors_are_dbus_stale "$errors"; then
+            if command -v xterm >/dev/null 2>&1; then
+                : >"$errfile"
+                run_terminal_command "xterm -e" "$cmd" "$errfile"
+                rc=$?
+                errors=$(cat "$errfile")
+            else
+                rm -f "$errfile"
+                echo "Terminal launch failed: gnome-terminal-server appears to be in a bad state."
+                echo "Shuttle will not restart it automatically because that kills other CC sessions."
+                echo "Restart gnome-terminal-server manually if you want to continue using gnome-terminal."
+                echo "Session is still running in tmux — attach manually"
+                return 1
+            fi
+        fi
+
         rm -f "$errfile"
         # Only warn on real errors, not GTK noise or fallback messages
-        if echo "$errors" | grep -qiE "error|failed|cannot" && ! echo "$errors" | grep -q "Falling back"; then
+        if { [ $rc -ne 0 ] || [ -n "$errors" ]; } && terminal_errors_need_warning "$errors"; then
             echo "Warning: terminal launch may have failed:"
             echo "  $errors"
             echo "Session is still running in tmux — attach manually"
@@ -155,6 +205,8 @@ launch_terminal() {
     else
         rm -f "$errfile"
     fi
+
+    return 0
 }
 
 # Format seconds as relative time with minutes precision (e.g., "2m", "3h 42m")
