@@ -14,7 +14,6 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # Default configuration values
 SHUTTLE_DEFAULT_PROJECT=""           # Default project directory (empty = use pwd)
 SHUTTLE_DEFAULT_SITE="ledger"        # Default site for briefs
-SHUTTLE_TERMINAL="gnome-terminal --" # Terminal emulator command
 SHUTTLE_HEADLESS_DEFAULT=""          # Default headless mode (empty = auto-detect)
 SHUTTLE_PROMPT_TIMEOUT=12            # Seconds to wait for Claude prompt
 
@@ -49,7 +48,6 @@ load_config
 # Apply environment variable overrides (higher precedence than config file)
 [ -n "$SHUTTLE_PROJECT" ] && SHUTTLE_DEFAULT_PROJECT="$SHUTTLE_PROJECT"
 [ -n "$SHUTTLE_SITE" ] && SHUTTLE_DEFAULT_SITE="$SHUTTLE_SITE"
-[ -n "$SHUTTLE_TERM" ] && SHUTTLE_TERMINAL="$SHUTTLE_TERM"
 [ -n "$SHUTTLE_TIMEOUT" ] && SHUTTLE_PROMPT_TIMEOUT="$SHUTTLE_TIMEOUT"
 
 # =============================================================================
@@ -166,14 +164,58 @@ run_terminal_command() {
     return $rc
 }
 
-# Launch terminal with given command
+# Verify a window with the given title appeared in the X server.
+# Polls for up to ~2 seconds via wmctrl or xdotool. Returns 0 if found,
+# 1 if neither tool is available (treated as inconclusive, not failure),
+# 2 if the tool ran but no matching window appeared.
+verify_window_opened() {
+    local title="$1"
+    local tool=""
+
+    if command -v wmctrl >/dev/null 2>&1; then
+        tool="wmctrl"
+    elif command -v xdotool >/dev/null 2>&1; then
+        tool="xdotool"
+    else
+        return 1
+    fi
+
+    local attempts=20
+    while [ $attempts -gt 0 ]; do
+        if [ "$tool" = "wmctrl" ]; then
+            if wmctrl -l 2>/dev/null | grep -Fq "$title"; then
+                return 0
+            fi
+        else
+            if xdotool search --name "$title" >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+        sleep 0.1
+        ((attempts -= 1))
+    done
+
+    return 2
+}
+
+# Launch terminal with given command.
+# Args: $1 = command to run inside terminal, $2 = window title (defaults to "shuttle")
 launch_terminal() {
     local cmd="$1"
+    local title="${2:-shuttle}"
     local errfile
     errfile=$(mktemp /tmp/shuttle-term-XXXXXX)
 
-    run_terminal_command "$SHUTTLE_TERMINAL" "$cmd" "$errfile"
+    # Unset GNOME_TERMINAL_{SCREEN,SERVICE} before invoking gnome-terminal.
+    # These vars are set inside a running gnome-terminal so child shells can
+    # attach to the same screen. If shuttle was launched from a gnome-terminal
+    # that has since closed (or the server restarted), the inherited screen
+    # path is dead — every new gnome-terminal client will fail with
+    # "Failed to get screen from object path ..." even though the server is
+    # perfectly healthy. Stripping the vars forces a fresh screen.
+    run_terminal_command "env -u GNOME_TERMINAL_SCREEN -u GNOME_TERMINAL_SERVICE gnome-terminal --title $title --" "$cmd" "$errfile"
     local rc=$?
+    local used_fallback=""
 
     if [ $rc -ne 0 ] || [ -s "$errfile" ]; then
         local errors
@@ -182,14 +224,15 @@ launch_terminal() {
         if terminal_errors_are_dbus_stale "$errors"; then
             if command -v xterm >/dev/null 2>&1; then
                 : >"$errfile"
-                run_terminal_command "xterm -e" "$cmd" "$errfile"
+                run_terminal_command "xterm -T $title -e" "$cmd" "$errfile"
                 rc=$?
                 errors=$(cat "$errfile")
+                used_fallback=1
             else
                 rm -f "$errfile"
-                echo "Terminal launch failed: gnome-terminal-server appears to be in a bad state."
-                echo "Shuttle will not restart it automatically because that kills other CC sessions."
-                echo "Restart gnome-terminal-server manually if you want to continue using gnome-terminal."
+                echo "Terminal launch failed and xterm fallback unavailable."
+                echo "Try 'shuttle doctor' to diagnose; common cause is a stale"
+                echo "GNOME_TERMINAL_SCREEN env var (should be auto-unset, file a bug)."
                 echo "Session is still running in tmux — attach manually"
                 return 1
             fi
@@ -204,6 +247,20 @@ launch_terminal() {
         fi
     else
         rm -f "$errfile"
+    fi
+
+    # Post-launch verification: gnome-terminal-server returns rc=0 instantly via fork,
+    # so an exit code alone tells us nothing about whether a window actually appeared.
+    # If wmctrl or xdotool is available, confirm the window exists.
+    if [ -z "$used_fallback" ] && [ -z "$SHUTTLE_SKIP_WINDOW_CHECK" ]; then
+        verify_window_opened "$title"
+        local vrc=$?
+        if [ $vrc -eq 2 ]; then
+            echo "Warning: gnome-terminal returned success but no window titled '$title' appeared."
+            echo "  gnome-terminal-server may be wedged. Try 'shuttle doctor' to diagnose."
+            echo "  Session is still running in tmux — attach with: tmux attach -t ${cmd##* }"
+            return 1
+        fi
     fi
 
     return 0
@@ -400,7 +457,7 @@ case "$CMD" in
         if [ -n "$HEADLESS" ]; then
             tmux attach -t "$SESSION"
         else
-            launch_terminal "tmux attach -t $SESSION"
+            launch_terminal "tmux attach -t $SESSION" "shuttle:$SESSION"
         fi
         ;;
 
@@ -949,7 +1006,7 @@ case "$CMD" in
         if [ -n "$HEADLESS" ] || [ -n "$SHUTTLE_HEADLESS" ] || [ -z "$DISPLAY" ]; then
             echo "Attach with: tmux attach -t $TMUX_SESSION"
         else
-            launch_terminal "tmux attach -t $TMUX_SESSION"
+            launch_terminal "tmux attach -t $TMUX_SESSION" "shuttle:$TMUX_SESSION"
             echo "Launched $TMUX_SESSION"
         fi
         ;;
@@ -1338,7 +1395,7 @@ $CONTENT
             if [ -n "$HEADLESS" ]; then
                 echo "Attach with: tmux attach -t $SESSION"
             else
-                launch_terminal "tmux attach -t $SESSION"
+                launch_terminal "tmux attach -t $SESSION" "shuttle:$SESSION"
             fi
             exit 0
         fi
@@ -1373,7 +1430,7 @@ $CONTENT
             echo "Session ready: $SESSION"
             echo "Attach with: tmux attach -t $SESSION"
         else
-            launch_terminal "tmux attach -t $SESSION"
+            launch_terminal "tmux attach -t $SESSION" "shuttle:$SESSION"
             echo "Launched $SESSION"
         fi
         ;;
@@ -1522,14 +1579,13 @@ $CONTENT
         echo "Current settings:"
         echo "  SHUTTLE_DEFAULT_PROJECT = ${SHUTTLE_DEFAULT_PROJECT:-(not set, uses pwd)}"
         echo "  SHUTTLE_DEFAULT_SITE    = $SHUTTLE_DEFAULT_SITE"
-        echo "  SHUTTLE_TERMINAL        = $SHUTTLE_TERMINAL"
         echo "  SHUTTLE_HEADLESS_DEFAULT= ${SHUTTLE_HEADLESS_DEFAULT:-(auto-detect)}"
         echo "  SHUTTLE_PROMPT_TIMEOUT  = ${SHUTTLE_PROMPT_TIMEOUT}s"
+        echo "  Terminal                = gnome-terminal (hardcoded; xterm emergency fallback)"
         echo ""
         echo "Environment overrides (set these to override config):"
         echo "  SHUTTLE_PROJECT  = ${SHUTTLE_PROJECT:-}"
         echo "  SHUTTLE_SITE     = ${SHUTTLE_SITE:-}"
-        echo "  SHUTTLE_TERM     = ${SHUTTLE_TERM:-}"
         echo "  SHUTTLE_HEADLESS = ${SHUTTLE_HEADLESS:-}"
         echo "  SHUTTLE_TIMEOUT  = ${SHUTTLE_TIMEOUT:-}"
         echo ""
@@ -1543,15 +1599,101 @@ SHUTTLE_DEFAULT_PROJECT=~/projects/main
 # Default SKEIN site for briefs
 SHUTTLE_DEFAULT_SITE=ledger
 
-# Terminal emulator command
-SHUTTLE_TERMINAL="gnome-terminal --"
-
 # Always run headless (set to 1, or leave empty for auto-detect)
 SHUTTLE_HEADLESS_DEFAULT=
 
 # Prompt detection timeout in seconds
 SHUTTLE_PROMPT_TIMEOUT=12
 EXAMPLE
+        ;;
+
+    doctor|dr)
+        echo "SHUTTLE DOCTOR — gnome-terminal launch diagnostics"
+        echo ""
+
+        echo "Display"
+        echo "  DISPLAY          = ${DISPLAY:-(unset — headless)}"
+        echo "  WAYLAND_DISPLAY  = ${WAYLAND_DISPLAY:-(unset)}"
+        echo "  XDG_SESSION_TYPE = ${XDG_SESSION_TYPE:-(unset)}"
+        echo ""
+
+        echo "Inherited gnome-terminal env (stripped before each launch)"
+        if [ -n "$GNOME_TERMINAL_SCREEN" ]; then
+            echo "  GNOME_TERMINAL_SCREEN  = $GNOME_TERMINAL_SCREEN"
+            echo "    -> inherited from a parent gnome-terminal. If that window is closed,"
+            echo "       the path is dead and any bare 'gnome-terminal' call in this shell"
+            echo "       will fail. Shuttle strips this var before launching."
+        else
+            echo "  GNOME_TERMINAL_SCREEN  = (unset — clean)"
+        fi
+        if [ -n "$GNOME_TERMINAL_SERVICE" ]; then
+            echo "  GNOME_TERMINAL_SERVICE = $GNOME_TERMINAL_SERVICE"
+        else
+            echo "  GNOME_TERMINAL_SERVICE = (unset — clean)"
+        fi
+        echo ""
+
+        echo "gnome-terminal"
+        if command -v gnome-terminal >/dev/null 2>&1; then
+            echo "  binary           = $(command -v gnome-terminal)"
+            GT_VERSION=$(gnome-terminal --version 2>&1 | head -1)
+            echo "  version          = ${GT_VERSION:-(unknown)}"
+        else
+            echo "  binary           = NOT FOUND"
+        fi
+        GT_SERVER=$(pgrep -fa gnome-terminal-server | head -1)
+        if [ -n "$GT_SERVER" ]; then
+            echo "  server pid       = $(echo "$GT_SERVER" | awk '{print $1}')"
+        else
+            echo "  server pid       = (not running — will spawn on first launch)"
+        fi
+        echo ""
+
+        echo "Fallback / verification tools"
+        for tool in xterm wmctrl xdotool dbus-launch; do
+            if command -v "$tool" >/dev/null 2>&1; then
+                echo "  $tool $(printf '%*s' $((14 - ${#tool})) '')= $(command -v "$tool")"
+            else
+                echo "  $tool $(printf '%*s' $((14 - ${#tool})) '')= (missing)"
+            fi
+        done
+        echo ""
+
+        echo "Smoke test: gnome-terminal --wait -- bash -c 'exit 0' (with stale env stripped)"
+        if [ -z "$DISPLAY" ] && [ -z "$WAYLAND_DISPLAY" ]; then
+            echo "  SKIPPED — no display available (headless box)"
+        elif ! command -v gnome-terminal >/dev/null 2>&1; then
+            echo "  SKIPPED — gnome-terminal not installed"
+        else
+            SMOKE_ERR=$(mktemp /tmp/shuttle-doctor-XXXXXX)
+            SMOKE_TITLE="shuttle-doctor-$$"
+            set +e
+            timeout 5 env -u GNOME_TERMINAL_SCREEN -u GNOME_TERMINAL_SERVICE \
+                gnome-terminal --title "$SMOKE_TITLE" --wait -- bash -c 'exit 0' 2>"$SMOKE_ERR"
+            SMOKE_RC=$?
+            set -e
+            SMOKE_STDERR=$(cat "$SMOKE_ERR")
+            rm -f "$SMOKE_ERR"
+            if [ "$SMOKE_RC" -eq 0 ] && [ -z "$SMOKE_STDERR" ]; then
+                echo "  PASS — gnome-terminal opened and exited cleanly"
+            elif [ "$SMOKE_RC" -eq 0 ]; then
+                echo "  PASS (with stderr noise — usually harmless GTK warnings):"
+                echo "$SMOKE_STDERR" | sed 's/^/    /'
+            else
+                echo "  FAIL — exit $SMOKE_RC"
+                if [ -n "$SMOKE_STDERR" ]; then
+                    echo "$SMOKE_STDERR" | sed 's/^/    /'
+                fi
+                if terminal_errors_are_dbus_stale "$SMOKE_STDERR"; then
+                    echo ""
+                    echo "  Diagnosis: stale env was stripped but gnome-terminal still failed."
+                    echo "  This points at a genuinely sick gnome-terminal-server, not just"
+                    echo "  a leaked GNOME_TERMINAL_SCREEN. Recovery (kills other shuttle"
+                    echo "  windows — tmux sessions survive):"
+                    echo "    killall gnome-terminal-server"
+                fi
+            fi
+        fi
         ;;
 
     index|i)
@@ -1855,6 +1997,7 @@ Commands:
   unsplit         Close split pane
   ground          Kill all shuttle sessions
   config, cfg     Show current configuration
+  doctor, dr      Diagnose gnome-terminal launch environment
 
 Index options:
   --update, -u    Incremental update (only changed files)
@@ -1904,9 +2047,9 @@ Configuration:
   Environment variables (override config file):
     SHUTTLE_PROJECT   Default project directory
     SHUTTLE_SITE      Default SKEIN site for briefs
-    SHUTTLE_TERM      Terminal emulator command
     SHUTTLE_HEADLESS  Force headless mode (1 = always headless)
     SHUTTLE_TIMEOUT   Prompt detection timeout in seconds
+    SHUTTLE_SKIP_WINDOW_CHECK  Skip post-launch window verification (set to 1)
 
 Export options:
   --json, -j        Output as JSON instead of markdown

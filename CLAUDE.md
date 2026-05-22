@@ -30,6 +30,7 @@ shuttle ls           # list sessions
 shuttle kill <n>     # kill session
 shuttle ground       # kill all shuttle sessions
 shuttle config       # show current configuration
+shuttle doctor       # diagnose gnome-terminal launch environment
 ```
 
 ## Session State Indicators
@@ -114,9 +115,6 @@ SHUTTLE_DEFAULT_PROJECT=~/projects/main
 # Default SKEIN site for briefs
 SHUTTLE_DEFAULT_SITE=ledger
 
-# Terminal emulator command
-SHUTTLE_TERMINAL="gnome-terminal --"
-
 # Always run headless (set to 1, or leave empty for auto-detect)
 SHUTTLE_HEADLESS_DEFAULT=
 
@@ -127,6 +125,12 @@ SHUTTLE_PROMPT_TIMEOUT=12
 Precedence: CLI flags > Environment variables > Config file > Defaults
 
 Run `shuttle config` to see current settings.
+
+Shuttle launches windows via gnome-terminal. There is no terminal-selection
+config knob — gnome-terminal is the target. If gnome-terminal-server is in a
+bad D-Bus state, shuttle falls back to xterm for that one launch so the session
+stays reachable; it will not restart gnome-terminal-server automatically
+(that would kill other shuttle sessions). Run `shuttle doctor` to diagnose.
 
 ## Session Index
 
