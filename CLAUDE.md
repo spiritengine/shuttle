@@ -2,6 +2,57 @@
 
 CLI for launching and managing Claude Code pairing sessions.
 
+## Starting a new session on this repo (for agents)
+
+Run SKEIN commands from the **shuttle project root** — SKEIN auto-detects the
+project from the `.skein/` directory that lives there.
+
+```bash
+cd ~/projects/shuttle
+```
+
+From anywhere else, skein commands fail with "No project specified."
+
+### Full lifecycle: ignite → ready → work → torch → complete
+
+```bash
+# 1. Register identity. Ignite assigns a name like "spade-0521".
+skein ignite --message "<one-line description of what you're doing>"
+
+# 2. Read CLAUDE.md (this file), check docs/, then register in the roster:
+skein --agent <name> ready
+
+# 3. While working, post folios. Most write commands need --agent:
+skein --agent <name> post finding shuttle "<title>" --details "..."
+skein --agent <name> post friction shuttle "<title>" --details "..."
+
+# 4. When done, retire:
+skein --agent <name> torch       # prompts for reflection
+skein --agent <name> complete    # remove from roster
+```
+
+To skip the `--agent` flag on every command, export the id once:
+
+```bash
+export SKEIN_AGENT_ID=<name>
+```
+
+### Other ignite forms
+
+```bash
+skein ignite                          # bare, generic orientation
+skein ignite brief-20260521-gfre      # start from a handoff brief
+skein ignite --mantle quartermaster   # come up as a quartermaster (QM)
+```
+
+### Gotcha: if you forgot to ignite
+
+`close`, `torch`, and `complete` reject with "Must set SKEIN_AGENT_ID or use
+--agent flag." You can ignite belatedly and then run them, but cleaner to
+ignite first. The orientation phase only matters for record-keeping — you can
+post folios immediately after `skein --agent <name> ready` without doing the
+full required-reading dance if the task is small.
+
 ## Commands
 
 ```bash
@@ -102,7 +153,10 @@ You can use shuttle to launch pairing sessions for humans:
 shuttle go brief-20251210-ceor
 ```
 
-This opens a new terminal with CC already ignited on the brief.
+This opens a new gnome-terminal running a fresh Claude Code session, then sends
+it a `HANDOFF: <brief-id>` message. The new CC picks up the handoff and ignites
+from the brief itself (`skein ignite <brief-id>`) — shuttle does not run ignite
+on its behalf.
 
 ## Configuration
 
@@ -158,6 +212,7 @@ shuttle search -l -p speakbot      # list sessions for speakbot project
 
 - Single bash script at `bin/shuttle`
 - Uses tmux for session management
-- Uses configurable terminal emulator (default: gnome-terminal)
+- Launches windows via gnome-terminal (with xterm emergency fallback for
+  dbus-stale errors — see `shuttle doctor`)
 - Integrates with SKEIN for briefs and shards
 - Session index in `~/.shuttle/index.json` for fast search
