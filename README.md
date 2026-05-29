@@ -17,7 +17,6 @@ shuttle board <n>        # board session by number or name
 shuttle ls               # list active sessions
 shuttle kill <n>         # kill session by number or name
 shuttle ground           # kill all shuttle sessions
-shuttle briefs [site]    # show open briefs
 ```
 
 ## Examples

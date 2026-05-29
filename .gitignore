@@ -4,3 +4,5 @@ parser/__pycache__/
 parser/.pytest_cache/
 sessions/
 .hypothesis/
+training_data/
+.claude/settings.local.json
