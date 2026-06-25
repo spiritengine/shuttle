@@ -351,6 +351,108 @@ format_state() {
     esac
 }
 
+# --- SKEIN folio resolution -------------------------------------------------
+# Shuttle is agnostic to the folio-id grammar. It passes whatever the user
+# typed straight to `skein folio --json` and reads structured fields back,
+# so content-hash ids, short hashes, type-prefixed ids, and legacy brief-
+# slugs all work — skein owns id resolution, shuttle just consumes the JSON.
+
+# Turn a folio title into a session-name slug (lowercase, dashed, <=25 chars).
+# Trailing dash is stripped AFTER the length cut, so truncation can't leave one.
+slugify_title() {
+    printf '%s' "$1" \
+        | tr '[:upper:]' '[:lower:]' \
+        | tr '[:space:]' '-' \
+        | sed 's/[^a-z0-9-]//g; s/--*/-/g; s/^-*//' \
+        | cut -c1-25 \
+        | sed 's/-*$//'
+}
+
+# Make an arbitrary string safe as a tmux session name. tmux treats ':' and '.'
+# as target separators, so a raw sha256:: id would break board/kill/send.
+sanitize_session() {
+    printf '%s' "$1" | tr -c 'a-zA-Z0-9_-' '-' | sed 's/--*/-/g; s/^-*//; s/-*$//'
+}
+
+# Map a registered project name to its filesystem path (empty if unknown).
+# --arg keeps a project name with quotes/backslashes from breaking the filter.
+project_path() {
+    [ -f ~/.skein/projects.json ] || return 0
+    jq -r --arg name "$1" '.projects[$name].path // empty' ~/.skein/projects.json 2>/dev/null
+}
+
+# Look up one folio by id, optionally scoped to another project's data dir.
+#   $1 = folio id (any form)
+#   $2 = data dir (a project's .skein path; empty = cwd's ./.skein)
+# skein selects a project by --data-dir, NOT by any env var, so cross-project
+# lookups must point at the owning project's .skein directory.
+# On success: exit 0, sets RESOLVED_HASH + RESOLVED_TITLE. Else exit 1.
+skein_folio_json() {
+    local id="$1" data_dir="$2" json
+    if [ -n "$data_dir" ]; then
+        json=$(skein --data-dir "$data_dir" folio "$id" --json 2>/dev/null) || return 1
+    else
+        json=$(skein folio "$id" --json 2>/dev/null) || return 1
+    fi
+    [ -n "$json" ] || return 1
+    # Validate before extracting: skein could emit a non-JSON error on stdout.
+    printf '%s' "$json" | jq empty 2>/dev/null || return 1
+    RESOLVED_HASH=$(printf '%s' "$json" | jq -r '.content_hash // empty' 2>/dev/null) || return 1
+    RESOLVED_TITLE=$(printf '%s' "$json" | jq -r '.title // empty' 2>/dev/null) || return 1
+    [ -n "$RESOLVED_HASH" ] || return 1
+    return 0
+}
+
+# Resolve a brief id to its owning project, canonical hash, and title slug.
+#   $1 = brief id
+#   $2 = explicit project name from -p (empty = none)
+#   $3 = explicit project's launch dir from -p (empty = none)
+#   $4 = "1" if -d/--dir was given (skip cross-project scan), else empty
+# Sets: RESOLVED_HASH RESOLVED_TITLE RESOLVED_SLUG
+#       RESOLVED_PROJECT (empty = current/pwd)
+#       RESOLVED_PROJECT_DIR (set only when resolved via cross-project scan)
+# Returns: 0 found, 1 not found, 2 found but project dir unresolved.
+# NOTE: callers must invoke this as `resolve_brief ... || rc=$?` — a bare call
+# would trip `set -e` on the routine 1/2 returns before the caller can branch.
+resolve_brief() {
+    local id="$1" project="$2" project_dir="$3" explicit_dir="$4" search_project path data_dir
+    RESOLVED_HASH=""; RESOLVED_TITLE=""; RESOLVED_SLUG=""
+    RESOLVED_PROJECT=""; RESOLVED_PROJECT_DIR=""
+
+    # 1. Look in the LAUNCH directory's store (.skein), so the brief is resolved
+    #    in the same project the session will ignite in. parse_project_opts sets
+    #    project_dir for -p, -d, and the default alike; falling back to "" lets
+    #    skein use the cwd's ./.skein when no dir context is given (e.g. tests).
+    data_dir=""
+    [ -n "$project_dir" ] && data_dir="$project_dir/.skein"
+    if skein_folio_json "$id" "$data_dir"; then
+        RESOLVED_PROJECT="$project"
+        RESOLVED_SLUG=$(slugify_title "$RESOLVED_TITLE")
+        return 0
+    fi
+
+    # 2. With an explicit -d dir, don't go hunting other projects. (A -p miss
+    #    still falls through to the scan — the id may own a different project.)
+    [ -n "$explicit_dir" ] && return 1
+
+    # 3. Scan registered SKEIN projects by their data dirs. read-loop (not
+    #    `for $(...)`) so project names with whitespace/globs can't misbehave.
+    [ -f ~/.skein/projects.json ] || return 1
+    while IFS= read -r search_project; do
+        [ -n "$search_project" ] || continue
+        path=$(project_path "$search_project") || path=""
+        [ -n "$path" ] || continue
+        if skein_folio_json "$id" "$path/.skein"; then
+            RESOLVED_PROJECT="$search_project"
+            RESOLVED_PROJECT_DIR="$path"
+            RESOLVED_SLUG=$(slugify_title "$RESOLVED_TITLE")
+            [ -d "$RESOLVED_PROJECT_DIR" ] && return 0
+            return 2
+        fi
+    done < <(jq -r '.projects | keys[]' ~/.skein/projects.json 2>/dev/null)
+    return 1
+}
+
 CMD="${1:-status}"
 shift 2>/dev/null || true
 
@@ -361,7 +463,13 @@ case "$CMD" in
         SHARDS_TMP=$(mktemp)
         trap "rm -f $BRIEFS_TMP $SHARDS_TMP" EXIT
 
-        (skein folios "$SHUTTLE_DEFAULT_SITE" --type brief --status open 2>/dev/null | grep "brief-" | head -5 > "$BRIEFS_TMP") &
+        # skein renders "<type> <title>  <short-id>" per line; its short-id
+        # form tracks any folio-id format change, so display leans on it
+        # directly. (skein dropped list-level --status filtering, so this is
+        # recent briefs, not open-only — see READY/RECENT label below.)
+        # '|| true' keeps the subshell at exit 0 — under `set -e` a failed
+        # skein (e.g. unknown site) would otherwise abort the whole status.
+        (skein folios "$SHUTTLE_DEFAULT_SITE" --type brief -n 5 2>/dev/null > "$BRIEFS_TMP" || true) &
         BRIEFS_PID=$!
         (skein shard triage 2>/dev/null | tail -n +3 > "$SHARDS_TMP") &
         SHARDS_PID=$!
@@ -393,7 +501,7 @@ case "$CMD" in
 
         # Wait for briefs and display
         wait $BRIEFS_PID 2>/dev/null
-        echo "READY BRIEFS:"
+        echo "RECENT BRIEFS:"
         if [ -s "$BRIEFS_TMP" ]; then
             while read -r line; do
                 echo "  $line"
@@ -1307,7 +1415,7 @@ $CONTENT
         # Handle --help before parsing other options
         for arg in "$@"; do
             if [ "$arg" = "--help" ] || [ "$arg" = "-h" ]; then
-                echo "Usage: shuttle go [options] <brief-id>"
+                echo "Usage: shuttle go [options] <folio-id>"
                 echo ""
                 echo "Launch a new Claude Code session on a SKEIN brief."
                 echo ""
@@ -1318,9 +1426,9 @@ $CONTENT
                 echo "  -h, --help          Show this help"
                 echo ""
                 echo "Examples:"
-                echo "  shuttle go brief-20251210-ceor"
-                echo "  shuttle go -p skein brief-20251210-ceor"
-                echo "  shuttle go --headless brief-id"
+                echo "  shuttle go <folio-id>            # any skein folio id (short or full)"
+                echo "  shuttle go -p skein <folio-id>"
+                echo "  shuttle go --headless <folio-id>"
                 exit 0
             fi
         done
@@ -1329,65 +1437,47 @@ $CONTENT
         set -- "${POSITIONAL[@]}"
 
         if [ -z "$1" ]; then
-            echo "Usage: shuttle go [--dir PATH | --project NAME] <brief-id>"
+            echo "Usage: shuttle go [--dir PATH | --project NAME] <folio-id>"
             exit 1
         fi
         BRIEF_ID="$1"
 
-        # Check if brief exists and extract title for session name
-        # Use explicit project if -p was provided, otherwise SKEIN auto-detects from pwd
-        if [ -n "$PROJECT_NAME" ]; then
-            BRIEF_OUTPUT=$(SKEIN_PROJECT="$PROJECT_NAME" skein folio "$BRIEF_ID" 2>/dev/null)
-        else
-            BRIEF_OUTPUT=$(skein folio "$BRIEF_ID" 2>/dev/null)
-        fi
-        BRIEF_FOUND=""
-        BRIEF_TITLE=""
-        if echo "$BRIEF_OUTPUT" | grep -q "^folio $BRIEF_ID"; then
-            BRIEF_FOUND=1
-            BRIEF_TITLE=$(echo "$BRIEF_OUTPUT" | grep "^    #" | head -1 | sed 's/^[[:space:]]*#[[:space:]]*//' | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g' | sed 's/--*/-/g' | cut -c1-25)
-        fi
-
-        # If not found in current project, search other registered projects
-        # Skip cross-project search if user explicitly set a directory with -d
-        if [ -z "$BRIEF_FOUND" ] && [ -z "$EXPLICIT_DIR" ]; then
-            FOUND_PROJECT=""
-            FOUND_PROJECT_DIR=""
-            # Get list of registered projects from SKEIN
-            if [ -f ~/.skein/projects.json ]; then
-                for SEARCH_PROJECT in $(jq -r '.projects | keys[]' ~/.skein/projects.json 2>/dev/null); do
-                    SEARCH_OUTPUT=$(SKEIN_PROJECT="$SEARCH_PROJECT" skein folio "$BRIEF_ID" 2>/dev/null)
-                    if echo "$SEARCH_OUTPUT" | grep -q "^folio $BRIEF_ID"; then
-                        FOUND_PROJECT="$SEARCH_PROJECT"
-                        FOUND_PROJECT_DIR=$(jq -r ".projects[\"$SEARCH_PROJECT\"].path // empty" ~/.skein/projects.json 2>/dev/null)
-                        BRIEF_TITLE=$(echo "$SEARCH_OUTPUT" | grep "^    #" | head -1 | sed 's/^[[:space:]]*#[[:space:]]*//' | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g' | sed 's/--*/-/g' | cut -c1-25)
-                        break
-                    fi
-                done
-            fi
-
-            if [ -n "$FOUND_PROJECT" ] && [ -n "$FOUND_PROJECT_DIR" ] && [ -d "$FOUND_PROJECT_DIR" ]; then
-                # Auto-resolve: switch to the project that owns this brief
-                echo "Brief found in: $FOUND_PROJECT ($FOUND_PROJECT_DIR)"
-                PROJECT_DIR="$FOUND_PROJECT_DIR"
-                SESSION="shuttle-${BRIEF_TITLE:-$BRIEF_ID}"
-            elif [ -n "$FOUND_PROJECT" ]; then
-                # Found in SKEIN but can't resolve directory
-                echo "Brief belongs to project '$FOUND_PROJECT' but its path could not be resolved."
-                echo "Run: shuttle go -p $FOUND_PROJECT $BRIEF_ID"
+        # Resolve the brief via skein (id-agnostic — see resolve_brief()).
+        # `|| rc=$?` keeps the call out of `set -e`'s jaws so its routine 1/2
+        # returns reach the case below instead of aborting the script.
+        rc=0
+        resolve_brief "$BRIEF_ID" "$PROJECT_NAME" "$PROJECT_DIR" "$EXPLICIT_DIR" || rc=$?
+        case "$rc" in
+            0)
+                if [ -n "$RESOLVED_PROJECT_DIR" ]; then
+                    # Resolved in another project — switch to its directory.
+                    echo "Brief found in: $RESOLVED_PROJECT ($RESOLVED_PROJECT_DIR)"
+                    PROJECT_DIR="$RESOLVED_PROJECT_DIR"
+                fi
+                SESSION="shuttle-${RESOLVED_SLUG:-$BRIEF_ID}"
+                HANDOFF_ID="${RESOLVED_HASH:-$BRIEF_ID}"
+                ;;
+            2)
+                # Found in SKEIN but can't resolve the owning project's directory
+                echo "Brief belongs to project '$RESOLVED_PROJECT' but its path could not be resolved."
+                echo "Run: shuttle go -p $RESOLVED_PROJECT $BRIEF_ID"
                 exit 1
-            else
-                # Not found in any registered project
-                echo "Brief not found: $BRIEF_ID"
-                echo "Not found in current project or any registered SKEIN project."
-                exit 1
-            fi
-        elif [ -z "$BRIEF_TITLE" ]; then
-            # -d was explicit but brief not found — use brief ID as session name
-            SESSION="shuttle-${BRIEF_ID}"
-        else
-            SESSION="shuttle-${BRIEF_TITLE}"
-        fi
+                ;;
+            *)
+                if [ -n "$EXPLICIT_DIR" ]; then
+                    # Explicit -d: launch here even if the brief isn't in skein.
+                    SESSION="shuttle-${BRIEF_ID}"
+                    HANDOFF_ID="$BRIEF_ID"
+                else
+                    echo "Brief not found: $BRIEF_ID"
+                    echo "Not found in current project or any registered SKEIN project."
+                    exit 1
+                fi
+                ;;
+        esac
+        # Sanitize: a fallback to a raw sha256:: id would carry ':' into the
+        # tmux session name and break board/kill/send targeting.
+        SESSION=$(sanitize_session "$SESSION")
 
         # Check if session already exists - reboard instead of creating new
         if tmux has-session -t "$SESSION" 2>/dev/null; then
@@ -1422,8 +1512,8 @@ $CONTENT
         echo "Waiting for input handler..."
         sleep 4
 
-        # Send the HANDOFF message
-        tmux_send_cmd "$SESSION" "HANDOFF: $BRIEF_ID"
+        # Send the HANDOFF message (canonical id when skein resolved it)
+        tmux_send_cmd "$SESSION" "HANDOFF: ${HANDOFF_ID:-$BRIEF_ID}"
 
         # Open terminal or print attach instructions
         if [ -n "$HEADLESS" ]; then
@@ -1449,7 +1539,7 @@ $CONTENT
         set -- "${POSITIONAL[@]}"
 
         if [ -z "$1" ]; then
-            echo "Usage: shuttle $CMD [--dir PATH | --project NAME] <brief-id>"
+            echo "Usage: shuttle $CMD [--dir PATH | --project NAME] <folio-id>"
             exit 1
         fi
 
@@ -1460,43 +1550,33 @@ $CONTENT
         fi
 
         BRIEF_ID="$1"
+        HANDOFF_ID="$BRIEF_ID"
 
-        # Cross-project resolution (same logic as 'go')
-        BRIEF_FOUND=""
+        # Resolve the brief via skein (id-agnostic — see resolve_brief()),
+        # unless an explicit -d dir was given (then run here regardless).
+        # `|| rc=$?` keeps the 1/2 returns from tripping `set -e`.
         if [ -z "$EXPLICIT_DIR" ]; then
-            if [ -n "$PROJECT_NAME" ]; then
-                BRIEF_CHECK=$(SKEIN_PROJECT="$PROJECT_NAME" skein folio "$BRIEF_ID" 2>/dev/null)
-            else
-                BRIEF_CHECK=$(skein folio "$BRIEF_ID" 2>/dev/null)
-            fi
-            if echo "$BRIEF_CHECK" | grep -q "^folio $BRIEF_ID"; then
-                BRIEF_FOUND=1
-            else
-                FOUND_PROJECT=""
-                FOUND_PROJECT_DIR=""
-                if [ -f ~/.skein/projects.json ]; then
-                    for SEARCH_PROJECT in $(jq -r '.projects | keys[]' ~/.skein/projects.json 2>/dev/null); do
-                        if SKEIN_PROJECT="$SEARCH_PROJECT" skein folio "$BRIEF_ID" 2>/dev/null | grep -q "^folio $BRIEF_ID"; then
-                            FOUND_PROJECT="$SEARCH_PROJECT"
-                            FOUND_PROJECT_DIR=$(jq -r ".projects[\"$SEARCH_PROJECT\"].path // empty" ~/.skein/projects.json 2>/dev/null)
-                            break
-                        fi
-                    done
-                fi
-                if [ -n "$FOUND_PROJECT" ] && [ -n "$FOUND_PROJECT_DIR" ] && [ -d "$FOUND_PROJECT_DIR" ]; then
-                    echo "Brief found in: $FOUND_PROJECT ($FOUND_PROJECT_DIR)"
-                    PROJECT_DIR="$FOUND_PROJECT_DIR"
-                    BRIEF_FOUND=1
-                elif [ -n "$FOUND_PROJECT" ]; then
-                    echo "Brief belongs to project '$FOUND_PROJECT' but its path could not be resolved."
-                    echo "Use: shuttle $CMD -p $FOUND_PROJECT $BRIEF_ID"
+            rc=0
+            resolve_brief "$BRIEF_ID" "$PROJECT_NAME" "$PROJECT_DIR" "" || rc=$?
+            case "$rc" in
+                0)
+                    if [ -n "$RESOLVED_PROJECT_DIR" ]; then
+                        echo "Brief found in: $RESOLVED_PROJECT ($RESOLVED_PROJECT_DIR)"
+                        PROJECT_DIR="$RESOLVED_PROJECT_DIR"
+                    fi
+                    HANDOFF_ID="${RESOLVED_HASH:-$BRIEF_ID}"
+                    ;;
+                2)
+                    echo "Brief belongs to project '$RESOLVED_PROJECT' but its path could not be resolved."
+                    echo "Use: shuttle $CMD -p $RESOLVED_PROJECT $BRIEF_ID"
                     exit 1
-                else
+                    ;;
+                *)
                     echo "Brief not found: $BRIEF_ID"
                     echo "Not found in current project or any registered SKEIN project."
                     exit 1
-                fi
-            fi
+                    ;;
+            esac
         fi
 
         echo "Opening $SPLIT_TYPE split for $BRIEF_ID (in $PROJECT_DIR)..."
@@ -1521,7 +1601,7 @@ $CONTENT
         sleep 4
 
         # Send the HANDOFF to the specific pane we created
-        tmux_send_cmd "$NEW_PANE" "HANDOFF: $BRIEF_ID"
+        tmux_send_cmd "$NEW_PANE" "HANDOFF: ${HANDOFF_ID:-$BRIEF_ID}"
         echo "Split opened. Use 'shuttle unsplit' to close."
         ;;
 
@@ -2072,10 +2152,10 @@ Examples:
   shuttle search --list -a    # list all sessions from index
   shuttle search "auth" -a    # search content across all projects
   shuttle search -l -s 7      # list sessions from last 7 days
-  shuttle go brief-20251210-ceor
-  shuttle go -p skein brief-20251210-ceor  # launch in skein project
-  shuttle go --headless brief-id  # create session without opening terminal
-  shuttle split brief-20251210-ceor  # side-by-side pairing
+  shuttle go <folio-id>       # launch on any skein folio id (short or full)
+  shuttle go -p skein <folio-id>  # launch in skein project
+  shuttle go --headless <folio-id>  # create session without opening terminal
+  shuttle split <folio-id>    # side-by-side pairing
   shuttle board 1             # board first session
   shuttle peek 1              # see what session 1 is doing
   shuttle peek 2 50           # last 50 lines from session 2
