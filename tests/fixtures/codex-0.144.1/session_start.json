@@ -1,0 +1,9 @@
+{
+  "session_id": "019c1234-1111-7000-8000-000000000001",
+  "transcript_path": "/home/patrick/.codex/sessions/2026/07/12/rollout-session.jsonl",
+  "cwd": "/home/patrick/projects/shuttle",
+  "hook_event_name": "SessionStart",
+  "model": "gpt-5.4",
+  "permission_mode": "default",
+  "source": "startup"
+}

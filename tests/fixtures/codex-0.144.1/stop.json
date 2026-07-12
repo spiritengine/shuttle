@@ -1,0 +1,11 @@
+{
+  "session_id": "019c1234-1111-7000-8000-000000000001",
+  "transcript_path": "/home/patrick/.codex/sessions/2026/07/12/rollout-session.jsonl",
+  "cwd": "/home/patrick/projects/shuttle",
+  "hook_event_name": "Stop",
+  "model": "gpt-5.4",
+  "permission_mode": "default",
+  "turn_id": "019c1234-2222-7000-8000-000000000002",
+  "stop_hook_active": false,
+  "last_assistant_message": "The registry tests pass."
+}
