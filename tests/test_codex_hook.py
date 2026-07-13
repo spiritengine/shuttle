@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import subprocess
 from pathlib import Path
 
@@ -147,6 +148,34 @@ def test_binding_conflict_degrades_without_rebinding(
     )
     record = registry.get(launch["launch_id"])
     assert record["native_session_id"] == "native-original"
+    assert record["degraded"] is True
+    assert "BindingConflict" in record["errors"][-1]["error"]
+
+
+@pytest.mark.parametrize(
+    "fixture", ["user_prompt_submit", "permission_request", "stop"]
+)
+def test_non_start_event_cannot_drive_a_different_native_session(
+    registry: Registry, launch: dict, codex_payload, fixture: str
+) -> None:
+    registry.bind_native(launch["launch_id"], "native-original")
+    registry.transition(launch["launch_id"], "idle")
+    raw, _ = codex_payload(fixture)
+    payload = json.loads(raw)
+    payload["session_id"] = "native-other"
+
+    assert (
+        codex_hook.handle(
+            json.dumps(payload).encode(),
+            environ={"SHUTTLE_LAUNCH_ID": launch["launch_id"]},
+            registry=registry,
+            which=lambda _: None,
+        )
+        == 0
+    )
+    record = registry.get(launch["launch_id"])
+    assert record["native_session_id"] == "native-original"
+    assert record["state"] == "idle"
     assert record["degraded"] is True
     assert "BindingConflict" in record["errors"][-1]["error"]
 

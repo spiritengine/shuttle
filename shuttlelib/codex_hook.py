@@ -61,15 +61,17 @@ def _observe_event(
             raise ValueError(f"unsupported hook event: {event}")
         if launch_id is None:
             raise ValueError("SHUTTLE_LAUNCH_ID is not set")
-        if event == "SessionStart":
-            native_id = payload.get("session_id")
-            if not isinstance(native_id, str) or not native_id:
-                raise ValueError("SessionStart session_id must be a non-empty string")
-            registry.bind_native(
-                launch_id,
-                native_id,
-                resumed=payload.get("source") == "resume",
-            )
+        native_id = payload.get("session_id")
+        if not isinstance(native_id, str) or not native_id:
+            raise ValueError(f"{event} session_id must be a non-empty string")
+        # Every supported Codex hook carries the native session id. Revalidate
+        # the environment join on every event so a stale/misrouted hook cannot
+        # drive another launch's state after SessionStart bound its identity.
+        registry.bind_native(
+            launch_id,
+            native_id,
+            resumed=event == "SessionStart" and payload.get("source") == "resume",
+        )
         registry.transition(launch_id, _EVENT_STATES[event])
     except BaseException as exc:
         _record_failure(
