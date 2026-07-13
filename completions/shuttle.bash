@@ -15,7 +15,7 @@ _shuttle() {
     local cur prev words cword
     _init_completion || return
 
-    local commands="status watch ls list board b kill k peek p send go g split s vsplit vs unsplit ground help"
+    local commands="status watch ls list board b kill k peek p send go g split s vsplit vs unsplit ground hooks codex-hooks help"
 
     # If completing first argument (the command)
     if [[ $cword -eq 1 ]]; then
@@ -70,6 +70,10 @@ _shuttle() {
                 # Complete brief IDs
                 COMPREPLY=($(compgen -W "$(_shuttle_briefs)" -- "$cur"))
             fi
+            ;;
+
+        hooks|codex-hooks)
+            mapfile -t COMPREPLY < <(compgen -W "snippet show doctor check install" -- "$cur")
             ;;
 
         status|watch|ls|list|unsplit|ground|help)

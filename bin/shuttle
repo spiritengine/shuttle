@@ -1966,11 +1966,14 @@ $CONTENT
         HOOK_ACTION="${1:-snippet}"
         case "$HOOK_ACTION" in
             snippet|show)
-                echo "Exact ~/.codex/hooks.json for Shuttle (not written):"
+                echo "Shuttle Codex hook fragment for additive merge into ~/.codex/hooks.json (not a replacement):"
                 registry_cli hooks-snippet
                 ;;
+            install)
+                registry_cli hooks-install
+                ;;
             doctor|check)
-                echo "Exact ~/.codex/hooks.json for Shuttle (not written):"
+                echo "Shuttle Codex hook fragment for additive merge into ~/.codex/hooks.json (not a replacement):"
                 registry_cli hooks-snippet
                 echo ""
                 if registry_cli hooks-doctor; then
@@ -1981,7 +1984,7 @@ $CONTENT
                 fi
                 ;;
             *)
-                echo "Usage: shuttle hooks [snippet|doctor]"
+                echo "Usage: shuttle hooks [snippet|doctor|install]"
                 exit 1
                 ;;
         esac
@@ -2436,7 +2439,7 @@ Commands:
   ground          Kill all shuttle sessions
   config, cfg     Show current configuration
   doctor, dr      Diagnose gnome-terminal launch environment
-  hooks [action]  Print or diagnose the read-only Codex hook configuration
+  hooks [action]  Print, install, or diagnose additive Codex hooks
   hook codex      Codex hook stdin entry point (for hooks.json)
 
 Index options:
@@ -2517,6 +2520,7 @@ Examples:
   shuttle search -l -s 7      # list sessions from last 7 days
   shuttle go brief-20251210-ceor
   shuttle go --agent codex brief-20251210-ceor
+  shuttle hooks install      # add Shuttle hooks without replacing other hooks
   shuttle hooks doctor       # print/check hooks; never edits dotfiles
   shuttle go -p skein brief-20251210-ceor  # launch in skein project
   shuttle go --headless brief-id  # create session without opening terminal

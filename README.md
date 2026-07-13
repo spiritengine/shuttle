@@ -48,10 +48,11 @@ shuttle ground
 - Reboards existing same-provider sessions instead of creating duplicates
 - Uses structured Codex hook state for status and safe send decisions
 
-Codex hooks are never installed automatically. `shuttle hooks` prints the exact
-`~/.codex/hooks.json` document, and `shuttle hooks doctor` diagnoses the file and
-Codex trust records without writing either one. Codex still launches with a clear
-degraded warning when hooks are absent or untrusted.
+Codex hooks are never installed automatically. `shuttle hooks install` additively
+merges Shuttle's command hook into `~/.codex/hooks.json` without replacing other
+hooks, and `shuttle hooks doctor` diagnoses the file and Codex trust records
+without writing either one. Codex still launches with a clear degraded warning
+when hooks are absent or untrusted.
 
 ## Parser
 

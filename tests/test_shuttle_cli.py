@@ -4,9 +4,11 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from stat import S_IMODE
 
 import pytest
 
+from shuttlelib.cli import HOOK_COMMAND, HOOK_EVENTS
 from shuttlelib.sessions import Registry
 
 ROOT = Path(__file__).parents[1]
@@ -121,6 +123,24 @@ def install_gui_terminal(env: dict[str, str], tmp_path: Path) -> Path:
 
 def terminal_calls(path: Path) -> list[list[str]]:
     return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def write_json(path: Path, document: dict) -> None:
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+
+
+def hook_coords(document: dict, event: str) -> list[tuple[int, int]]:
+    coords = []
+    for group_index, group in enumerate(document["hooks"][event]):
+        for hook_index, hook in enumerate(group["hooks"]):
+            if hook == HOOK_COMMAND:
+                coords.append((group_index, hook_index))
+    return coords
+
+
+def trust_section(hooks_path: Path, event: str, group_index: int, hook_index: int) -> str:
+    key = f"{hooks_path}:{event.lower()}:{group_index}:{hook_index}"
+    return f'[hooks.state."{key}"]\ntrusted_hash = "sha256-test"\n\n'
 
 
 def test_go_provider_default_and_codex_initial_prompt(cli_env, tmp_path: Path) -> None:
@@ -415,6 +435,8 @@ def test_hooks_snippet_and_doctor_never_write_dotfiles(cli_env) -> None:
     hooks = Path(env["HOME"]) / ".codex" / "hooks.json"
     snippet = run_cli(env, "hooks")
     assert snippet.returncode == 0
+    assert b"not a replacement" in snippet.stdout
+    assert b"Exact ~/.codex/hooks.json" not in snippet.stdout
     for event in (b"SessionStart", b"UserPromptSubmit", b"PermissionRequest", b"Stop"):
         assert event in snippet.stdout
     assert b"shuttle hook codex" in snippet.stdout
@@ -424,6 +446,199 @@ def test_hooks_snippet_and_doctor_never_write_dotfiles(cli_env) -> None:
     assert doctor.returncode == 1
     assert b"missing:" in doctor.stdout
     assert not hooks.exists()
+
+
+def test_hooks_install_creates_missing_hooks_file_without_config_writes(cli_env) -> None:
+    env, _ = cli_env
+    codex_dir = Path(env["HOME"]) / ".codex"
+    hooks = codex_dir / "hooks.json"
+    config = codex_dir / "config.toml"
+
+    result = run_cli(env, "hooks", "install")
+
+    assert result.returncode == 0, result.stderr.decode()
+    assert b"updated:" in result.stdout
+    assert hooks.exists()
+    assert S_IMODE(hooks.stat().st_mode) == 0o600
+    assert not config.exists()
+    assert not hooks.with_name("hooks.json.shuttle.bak").exists()
+    installed = json.loads(hooks.read_text(encoding="utf-8"))
+    for event in HOOK_EVENTS:
+        assert hook_coords(installed, event) == [(0, 0)]
+
+
+def test_hooks_install_additively_merges_and_preserves_existing_hooks(
+    cli_env,
+) -> None:
+    env, _ = cli_env
+    codex_dir = Path(env["HOME"]) / ".codex"
+    codex_dir.mkdir()
+    hooks = codex_dir / "hooks.json"
+    config = codex_dir / "config.toml"
+    config.write_text("sentinel = true\n", encoding="utf-8")
+    sound_hook = {"type": "command", "command": "paplay /tmp/finished.wav"}
+    unrelated_hook = {"type": "command", "command": "echo keep", "timeout": 3}
+    stale_shuttle_hook = {
+        "type": "command",
+        "command": "shuttle hook codex",
+        "timeout": 99,
+        "extra": "stale",
+    }
+    existing = {
+        "top_level": {"preserve": ["anything"]},
+        "hooks": {
+            "SessionStart": [
+                {"matcher": "startup", "hooks": [unrelated_hook]},
+            ],
+            "PermissionRequest": [
+                {"hooks": [HOOK_COMMAND, stale_shuttle_hook, unrelated_hook]},
+            ],
+            "Stop": [
+                {"hooks": [sound_hook]},
+            ],
+            "OtherEvent": [
+                {"matcher": "other", "hooks": [{"type": "command", "command": "true"}]},
+            ],
+        },
+        "another_top_level_key": 42,
+    }
+    write_json(hooks, existing)
+    hooks.chmod(0o640)
+    before_stat = hooks.stat()
+
+    result = run_cli(env, "hooks", "install")
+
+    assert result.returncode == 0, result.stderr.decode()
+    assert b"updated:" in result.stdout
+    installed = json.loads(hooks.read_text(encoding="utf-8"))
+    assert installed["top_level"] == existing["top_level"]
+    assert installed["another_top_level_key"] == 42
+    assert installed["hooks"]["OtherEvent"] == existing["hooks"]["OtherEvent"]
+    assert installed["hooks"]["SessionStart"][0] == existing["hooks"]["SessionStart"][0]
+    assert installed["hooks"]["SessionStart"][1] == {"hooks": [HOOK_COMMAND]}
+    assert installed["hooks"]["PermissionRequest"][0]["hooks"] == [
+        unrelated_hook,
+        HOOK_COMMAND,
+    ]
+    assert installed["hooks"]["Stop"][0]["hooks"] == [sound_hook, HOOK_COMMAND]
+    expected_coords = {
+        "SessionStart": [(1, 0)],
+        "UserPromptSubmit": [(0, 0)],
+        "PermissionRequest": [(0, 1)],
+        "Stop": [(0, 1)],
+    }
+    for event in HOOK_EVENTS:
+        assert hook_coords(installed, event) == expected_coords[event]
+        flattened = [
+            hook
+            for group in installed["hooks"][event]
+            for hook in group["hooks"]
+            if hook.get("command") == "shuttle hook codex"
+        ]
+        assert flattened == [HOOK_COMMAND]
+    after_stat = hooks.stat()
+    assert S_IMODE(after_stat.st_mode) == 0o640
+    assert (after_stat.st_uid, after_stat.st_gid) == (
+        before_stat.st_uid,
+        before_stat.st_gid,
+    )
+    assert config.read_text(encoding="utf-8") == "sentinel = true\n"
+    backup = hooks.with_name("hooks.json.shuttle.bak")
+    assert backup.exists()
+    assert json.loads(backup.read_text(encoding="utf-8")) == existing
+    assert not list(codex_dir.glob(".hooks.json.*.tmp"))
+
+    first_bytes = hooks.read_bytes()
+    first_backup_bytes = backup.read_bytes()
+    second = run_cli(env, "hooks", "install")
+
+    assert second.returncode == 0, second.stderr.decode()
+    assert b"already installed:" in second.stdout
+    assert hooks.read_bytes() == first_bytes
+    assert backup.read_bytes() == first_backup_bytes
+    assert config.read_text(encoding="utf-8") == "sentinel = true\n"
+
+
+def test_hooks_doctor_trusts_the_actual_shuttle_hook_index(cli_env) -> None:
+    env, _ = cli_env
+    codex_dir = Path(env["HOME"]) / ".codex"
+    codex_dir.mkdir()
+    hooks = codex_dir / "hooks.json"
+    config = codex_dir / "config.toml"
+    sound_hook = {"type": "command", "command": "paplay /tmp/finished.wav"}
+    document = {
+        "hooks": {
+            "SessionStart": [{"hooks": [HOOK_COMMAND]}],
+            "UserPromptSubmit": [{"hooks": [HOOK_COMMAND]}],
+            "PermissionRequest": [{"hooks": [HOOK_COMMAND]}],
+            "Stop": [{"hooks": [sound_hook, HOOK_COMMAND]}],
+        }
+    }
+    write_json(hooks, document)
+    config.write_text(
+        "".join(
+            [
+                trust_section(hooks, "SessionStart", 0, 0),
+                trust_section(hooks, "UserPromptSubmit", 0, 0),
+                trust_section(hooks, "PermissionRequest", 0, 0),
+                trust_section(hooks, "Stop", 0, 0),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    wrong_index = run_cli(env, "hooks", "doctor")
+
+    assert wrong_index.returncode == 1
+    assert b"configured:" in wrong_index.stdout
+    assert b"configured but untrusted: Stop at 0:1" in wrong_index.stdout
+    assert b"all Shuttle Codex hooks are trusted" not in wrong_index.stdout
+
+    config.write_text(
+        "".join(
+            [
+                trust_section(hooks, "SessionStart", 0, 0),
+                trust_section(hooks, "UserPromptSubmit", 0, 0),
+                trust_section(hooks, "PermissionRequest", 0, 0),
+                trust_section(hooks, "Stop", 0, 1),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    trusted = run_cli(env, "hooks", "doctor")
+
+    assert trusted.returncode == 0, trusted.stderr.decode()
+    assert b"all Shuttle Codex hooks are trusted" in trusted.stdout
+
+
+@pytest.mark.parametrize(
+    ("name", "body"),
+    [
+        ("malformed", b'{"hooks": '),
+        ("non_object", b'["not", "an", "object"]\n'),
+    ],
+)
+def test_hooks_install_refuses_malformed_or_non_object_without_altering(
+    cli_env, name: str, body: bytes
+) -> None:
+    env, _ = cli_env
+    codex_dir = Path(env["HOME"]) / ".codex"
+    codex_dir.mkdir()
+    hooks = codex_dir / "hooks.json"
+    config = codex_dir / "config.toml"
+    hooks.write_bytes(body)
+    hooks.chmod(0o600)
+    config.write_text(f"name = {name!r}\n", encoding="utf-8")
+
+    result = run_cli(env, "hooks", "install")
+
+    assert result.returncode == 1
+    assert hooks.read_bytes() == body
+    assert S_IMODE(hooks.stat().st_mode) == 0o600
+    assert config.read_text(encoding="utf-8") == f"name = {name!r}\n"
+    assert not hooks.with_name("hooks.json.shuttle.bak").exists()
+    assert not list(codex_dir.glob(".hooks.json.*.tmp"))
 
 
 def test_hook_entry_preserves_stdin_bytes_and_stdout(cli_env, tmp_path: Path) -> None:
