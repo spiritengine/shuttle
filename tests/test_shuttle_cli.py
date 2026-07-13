@@ -30,6 +30,7 @@ args = sys.argv[1:]
 with open(os.environ['TMUX_LOG'], 'a') as stream:
     stream.write(json.dumps(args) + '\\n')
 sessions = [line.split('|') for line in os.environ.get('TMUX_SESSIONS', '').splitlines() if line]
+panes = [line.split('|') for line in os.environ.get('TMUX_PANES', '').splitlines() if line]
 cmd = args[0] if args else ''
 if cmd in ('list-sessions', 'ls'):
     if not sessions:
@@ -45,10 +46,23 @@ elif cmd == 'has-session':
     raise SystemExit(0 if any(row[0] == target for row in sessions) else 1)
 elif cmd == 'display-message':
     target = args[args.index('-t') + 1].lstrip('=')
+    fmt = args[-1] if args else ''
+    if fmt == '#{session_name}':
+        pane = next((row for row in panes if row[0] == target), None)
+        if pane and len(pane) > 1:
+            print(pane[1])
+            raise SystemExit(0)
+        row = next((row for row in sessions if row[0] == target), None)
+        if row:
+            print(row[0])
+            raise SystemExit(0)
+        raise SystemExit(1)
     row = next((row for row in sessions if row[0] == target), None)
     print(row[1] if row and len(row) > 1 else '0')
 elif cmd == 'capture-pane':
     print('> ')
+elif cmd == 'new-session':
+    raise SystemExit(int(os.environ.get('TMUX_NEW_SESSION_RC', '0')))
 """,
     )
     _executable(
@@ -89,6 +103,26 @@ def tmux_calls(path: Path) -> list[list[str]]:
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
+def install_gui_terminal(env: dict[str, str], tmp_path: Path) -> Path:
+    terminal_log = tmp_path / "terminal.log"
+    bin_dir = Path(env["PATH"].split(":", 1)[0])
+    _executable(
+        bin_dir / "gnome-terminal",
+        "import json,os,sys\n"
+        "with open(os.environ['TERMINAL_LOG'], 'a') as stream:\n"
+        "    stream.write(json.dumps(sys.argv[1:]) + '\\n')\n",
+    )
+    env["TERMINAL_LOG"] = str(terminal_log)
+    env["DISPLAY"] = ":99"
+    env["SHUTTLE_SKIP_WINDOW_CHECK"] = "1"
+    env.pop("SHUTTLE_HEADLESS", None)
+    return terminal_log
+
+
+def terminal_calls(path: Path) -> list[list[str]]:
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
 def test_go_provider_default_and_codex_initial_prompt(cli_env, tmp_path: Path) -> None:
     env, log = cli_env
     claude = run_cli(env, "go", "-d", str(tmp_path), "brief-1")
@@ -119,6 +153,21 @@ def test_default_agent_environment_override(cli_env, tmp_path: Path) -> None:
     assert Registry(env["SHUTTLE_HOME"]).list_launches()[-1]["provider"] == "codex"
 
 
+def test_go_closes_registry_record_when_tmux_new_session_fails(
+    cli_env, tmp_path: Path
+) -> None:
+    env, _ = cli_env
+    env["TMUX_NEW_SESSION_RC"] = "42"
+
+    result = run_cli(env, "go", "-d", str(tmp_path), "brief-1")
+
+    assert result.returncode == 42
+    record = Registry(env["SHUTTLE_HOME"]).list_launches()[-1]
+    assert record["state"] == "closed"
+    assert record["close_status"] == "failed"
+    assert record["exit_code"] == 42
+
+
 def test_exact_target_wins_and_ambiguous_partial_errors(cli_env) -> None:
     env, log = cli_env
     env["TMUX_SESSIONS"] = "task|0|1\nshuttle-task-one|0|1\nshuttle-task-two|0|1"
@@ -130,6 +179,18 @@ def test_exact_target_wins_and_ambiguous_partial_errors(cli_env) -> None:
     ambiguous = run_cli(env, "peek", "shuttle-task")
     assert ambiguous.returncode == 2
     assert b"Ambiguous session target" in ambiguous.stderr
+
+
+@pytest.mark.parametrize("target", ["0", "-1"])
+def test_numeric_targets_must_be_positive_before_indexing(cli_env, target: str) -> None:
+    env, log = cli_env
+    env["TMUX_SESSIONS"] = "shuttle-last|0|1"
+
+    result = run_cli(env, "peek", target)
+
+    assert result.returncode == 1
+    assert b"Session number must be positive" in result.stderr
+    assert not any(call[0] == "capture-pane" for call in tmux_calls(log))
 
 
 @pytest.mark.parametrize(
@@ -145,6 +206,79 @@ def test_target_commands_use_resolved_exact_tmux_name(
     assert result.returncode == 0, result.stderr.decode()
     call = next(call for call in tmux_calls(log) if call[0] == tmux_command)
     assert call[call.index("-t") + 1] == "=shuttle-unique-name"
+
+
+def test_board_gui_uses_argv_terminal_and_exact_attach_target(
+    cli_env, tmp_path: Path
+) -> None:
+    env, _ = cli_env
+    env["TMUX_SESSIONS"] = "shuttle-valid name|0|1"
+    terminal_log = install_gui_terminal(env, tmp_path)
+
+    result = run_cli(env, "board", "shuttle-valid name")
+
+    assert result.returncode == 0, result.stderr.decode()
+    assert terminal_calls(terminal_log)[-1] == [
+        "--title",
+        "shuttle:shuttle-valid name",
+        "--",
+        "tmux",
+        "attach",
+        "-t",
+        "=shuttle-valid name",
+    ]
+
+
+def test_go_reboard_gui_uses_exact_attach_target(cli_env, tmp_path: Path) -> None:
+    env, _ = cli_env
+    env["TMUX_SESSIONS"] = "shuttle-provider-test|0|1"
+    terminal_log = install_gui_terminal(env, tmp_path)
+
+    result = run_cli(env, "go", "-d", str(tmp_path), "brief-1")
+
+    assert result.returncode == 0, result.stderr.decode()
+    assert terminal_calls(terminal_log)[-1][-2:] == [
+        "-t",
+        "=shuttle-provider-test",
+    ]
+
+
+def test_go_gui_uses_exact_attach_target_after_launch(cli_env, tmp_path: Path) -> None:
+    env, _ = cli_env
+    terminal_log = install_gui_terminal(env, tmp_path)
+
+    result = run_cli(env, "go", "-d", str(tmp_path), "brief-1")
+
+    assert result.returncode == 0, result.stderr.decode()
+    assert terminal_calls(terminal_log)[-1][-2:] == [
+        "-t",
+        "=shuttle-provider-test",
+    ]
+
+
+def test_resume_gui_uses_exact_attach_target_after_launch(
+    cli_env, tmp_path: Path
+) -> None:
+    env, _ = cli_env
+    terminal_log = install_gui_terminal(env, tmp_path)
+    registry = Registry(env["SHUTTLE_HOME"])
+    old = registry.create_launch(
+        provider="codex",
+        mode="go",
+        cwd=tmp_path,
+        tmux_session="old",
+        title="Resume Me",
+    )
+    registry.bind_native(old["launch_id"], "019c-resume")
+    registry.close(old["launch_id"], status="exited", exit_code=0)
+
+    result = run_cli(env, "resume", "019c-resume")
+
+    assert result.returncode == 0, result.stderr.decode()
+    assert terminal_calls(terminal_log)[-1][-2:] == [
+        "-t",
+        "=shuttle-codex-resume-me",
+    ]
 
 
 def test_status_prefers_codex_registry_state_and_separates_liveness(
@@ -171,6 +305,7 @@ def test_status_prefers_codex_registry_state_and_separates_liveness(
 def test_send_is_literal_and_codex_force_requires_idle(cli_env, tmp_path: Path) -> None:
     env, log = cli_env
     env["TMUX_SESSIONS"] = "shuttle-codex-safe|0|1"
+    env["TMUX_PANES"] = "%3|shuttle-codex-safe"
     registry = Registry(env["SHUTTLE_HOME"])
     launch = registry.create_launch(
         provider="codex",
@@ -186,13 +321,44 @@ def test_send_is_literal_and_codex_force_requires_idle(cli_env, tmp_path: Path) 
     sent = run_cli(env, "send", "shuttle-codex-safe", message)
     assert sent.returncode == 0, sent.stderr.decode()
     assert not marker.exists()
+    pane_check = next(
+        call
+        for call in tmux_calls(log)
+        if call[:2] == ["display-message", "-t"] and call[2] == "%3"
+    )
+    assert pane_check[-1] == "#{session_name}"
     literal = next(call for call in tmux_calls(log) if "-l" in call)
+    assert literal[literal.index("-t") + 1] == "%3"
     assert literal[-2:] == ["--", message]
 
     registry.transition(launch["launch_id"], "working")
     refused = run_cli(env, "send", "--force", "shuttle-codex-safe", "try")
     assert refused.returncode == 1
     assert b"--force cannot override" in refused.stdout
+
+
+def test_codex_send_refuses_registry_pane_that_moved_sessions(
+    cli_env, tmp_path: Path
+) -> None:
+    env, log = cli_env
+    env["TMUX_SESSIONS"] = "shuttle-codex-safe|0|1\nother-session|0|1"
+    env["TMUX_PANES"] = "%3|other-session"
+    registry = Registry(env["SHUTTLE_HOME"])
+    launch = registry.create_launch(
+        provider="codex",
+        mode="go",
+        cwd=tmp_path,
+        tmux_session="shuttle-codex-safe",
+        pane_id="%3",
+        pid=os.getpid(),
+    )
+    registry.transition(launch["launch_id"], "idle")
+
+    result = run_cli(env, "send", "shuttle-codex-safe", "nope")
+
+    assert result.returncode == 1
+    assert b"pane %3 belongs to 'other-session'" in result.stdout
+    assert not any(call[0] == "send-keys" for call in tmux_calls(log))
 
 
 def test_codex_send_refuses_idle_record_with_dead_process(cli_env, tmp_path: Path) -> None:
@@ -212,6 +378,36 @@ def test_codex_send_refuses_idle_record_with_dead_process(cli_env, tmp_path: Pat
     result = run_cli(env, "send", "--force", "shuttle-codex-dead", "no")
     assert result.returncode == 1
     assert b"registry state is 'dead'" in result.stdout
+
+
+def test_relay_is_claude_only_and_keeps_claude_send_path(
+    cli_env, tmp_path: Path
+) -> None:
+    env, log = cli_env
+    env["TMUX_SESSIONS"] = "shuttle-claude|0|1\nshuttle-codex-relay|0|1"
+    registry = Registry(env["SHUTTLE_HOME"])
+    registry.create_launch(
+        provider="codex",
+        mode="go",
+        cwd=tmp_path,
+        tmux_session="shuttle-codex-relay",
+        pane_id="%9",
+        pid=os.getpid(),
+    )
+    payload = tmp_path / "payload.txt"
+    payload.write_text("hello from relay", encoding="utf-8")
+
+    refused = run_cli(env, "relay", "shuttle-codex-relay", str(payload))
+    assert refused.returncode == 1
+    assert b"is not a claude session" in refused.stderr
+    assert not any(call[0] == "send-keys" for call in tmux_calls(log))
+
+    log.write_text("")
+    sent = run_cli(env, "relay", "shuttle-claude", str(payload))
+    assert sent.returncode == 0, sent.stderr.decode()
+    literal = next(call for call in tmux_calls(log) if "-l" in call)
+    assert literal[literal.index("-t") + 1] == "=shuttle-claude"
+    assert literal[-2:] == ["--", "hello from relay"]
 
 
 def test_hooks_snippet_and_doctor_never_write_dotfiles(cli_env) -> None:
@@ -271,6 +467,33 @@ def test_resume_infers_codex_identity_and_passes_explicit_prompt(
     assert "codex resume 019c-resume" in command
     assert "continue\\ carefully" in command
     assert "--last" not in command
+
+
+def test_resume_closes_registry_record_when_tmux_new_session_fails(
+    cli_env, tmp_path: Path
+) -> None:
+    env, _ = cli_env
+    registry = Registry(env["SHUTTLE_HOME"])
+    old = registry.create_launch(
+        provider="codex",
+        mode="go",
+        cwd=tmp_path,
+        tmux_session="old",
+        title="Resume Me",
+    )
+    registry.bind_native(old["launch_id"], "019c-resume")
+    registry.close(old["launch_id"], status="exited", exit_code=0)
+    env["TMUX_NEW_SESSION_RC"] = "43"
+
+    result = run_cli(env, "resume", "019c-resume", "continue carefully")
+
+    assert result.returncode == 43
+    current = registry.list_launches()[-1]
+    assert current["provider"] == "codex"
+    assert current["resume_of"] == "019c-resume"
+    assert current["state"] == "closed"
+    assert current["close_status"] == "failed"
+    assert current["exit_code"] == 43
 
 
 def test_raw_codex_uuid_requires_explicit_provider(cli_env, tmp_path: Path) -> None:

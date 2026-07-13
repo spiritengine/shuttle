@@ -122,6 +122,11 @@ def build_parser() -> argparse.ArgumentParser:
     failure.add_argument("launch_id")
     failure.add_argument("message")
 
+    close = subs.add_parser("close")
+    close.add_argument("launch_id")
+    close.add_argument("--status", required=True)
+    close.add_argument("--exit-code", type=int)
+
     subs.add_parser("hooks-snippet")
     doctor = subs.add_parser("hooks-doctor")
     doctor.add_argument("--quiet", action="store_true")
@@ -183,6 +188,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "degrade":
             registry.record_failure(
                 args.launch_id, stage="launcher", error=args.message
+            )
+        elif args.command == "close":
+            registry.close(
+                args.launch_id, status=args.status, exit_code=args.exit_code
             )
         elif args.command == "hooks-snippet":
             print(json.dumps(hook_document(), indent=2))

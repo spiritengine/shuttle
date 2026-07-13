@@ -13,6 +13,30 @@ from typing import Any
 
 from .sessions import Registry
 
+CHILD_STOP_TIMEOUT = 5.0
+
+
+def _stop_child(child: subprocess.Popen[Any] | None) -> None:
+    if child is None or child.poll() is not None:
+        return
+    try:
+        child.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        child.wait(timeout=CHILD_STOP_TIMEOUT)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        child.kill()
+    except ProcessLookupError:
+        return
+    try:
+        child.wait(timeout=CHILD_STOP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        pass
+
 
 def _forward_closed(record: dict[str, Any], outcome: str) -> None:
     native_id = record.get("native_session_id")
@@ -93,6 +117,7 @@ def supervise(
         return returncode if returncode >= 0 else 128 + (-returncode)
     except BaseException as exc:
         try:
+            _stop_child(child)
             registry.record_failure(
                 launch_id, stage="supervisor", error=f"{type(exc).__name__}: {exc}"
             )

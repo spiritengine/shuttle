@@ -164,6 +164,36 @@ registry_cli() {
     PYTHONPATH="$SHUTTLE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m shuttlelib.cli "$@"
 }
 
+close_launch_failed() {
+    local launch_id="$1"
+    local exit_code="$2"
+    local message="$3"
+    registry_cli degrade "$launch_id" "$message" || true
+    registry_cli close "$launch_id" --status failed --exit-code "$exit_code" || true
+}
+
+run_tmux_new_session() {
+    local session="$1"
+    local project_dir="$2"
+    local command="$3"
+    local had_errexit=""
+
+    case "$-" in
+        *e*)
+            had_errexit=1
+            set +e
+            ;;
+    esac
+
+    tmux new-session -d -s "$session" -c "$project_dir" "$command"
+    TMUX_NEW_SESSION_RC=$?
+
+    if [ -n "$had_errexit" ]; then
+        set -e
+    fi
+    return 0
+}
+
 record_for_session() {
     registry_cli lookup-tmux --live "$1" 2>/dev/null
 }
@@ -180,6 +210,49 @@ provider_for_session() {
     fi
 }
 
+load_codex_send_record() {
+    local session="$1"
+    local record
+    local -a fields
+    CODEX_STATE="unknown"
+    CODEX_PANE_ID=""
+    CODEX_PID=""
+
+    record=$(record_for_session "$session" || true)
+    if [ -z "$record" ]; then
+        return 0
+    fi
+
+    IFS=$'\x1f' read -r -a fields <<< "$record"
+    CODEX_STATE="${fields[2]}"
+    CODEX_PANE_ID="${fields[4]}"
+    CODEX_PID="${fields[5]:-}"
+    if [ "$CODEX_STATE" = "idle" ]; then
+        if [ -z "$CODEX_PID" ]; then
+            CODEX_STATE="stale"
+        elif ! kill -0 "$CODEX_PID" 2>/dev/null; then
+            CODEX_STATE="dead"
+        fi
+    fi
+}
+
+verify_codex_send_pane() {
+    local expected_session="$1"
+    local pane_id="$2"
+    local pane_session
+
+    if [ -z "$pane_id" ]; then
+        echo "Refusing to send to Codex: registry has no pane id."
+        return 1
+    fi
+
+    pane_session=$(tmux display-message -t "$pane_id" -p '#{session_name}' 2>/dev/null || true)
+    if [ "$pane_session" != "$expected_session" ]; then
+        echo "Refusing to send to Codex: pane $pane_id belongs to '${pane_session:-no live session}', not '$expected_session'."
+        return 1
+    fi
+}
+
 # Resolve a human target without ever silently choosing among partial matches.
 # Exact tmux names win, numeric targets are positional convenience, and a
 # partial name must identify exactly one provider-compatible session.
@@ -191,8 +264,17 @@ resolve_session() {
     local name provider
     mapfile -t names < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
 
-    if [[ "$target" =~ ^[0-9]+$ ]]; then
-        name="${names[$((target - 1))]:-}"
+    if [[ "$target" =~ ^-?[0-9]+$ ]]; then
+        if [[ "$target" == -* ]]; then
+            echo "Session number must be positive: $target" >&2
+            return 1
+        fi
+        local target_number=$((10#$target))
+        if [ "$target_number" -le 0 ]; then
+            echo "Session number must be positive: $target" >&2
+            return 1
+        fi
+        name="${names[$((target_number - 1))]:-}"
         if [ -z "$name" ]; then
             echo "Session not found: $target" >&2
             return 1
@@ -258,9 +340,8 @@ terminal_errors_need_warning() {
 }
 
 run_terminal_command() {
-    local terminal="$1"
-    local cmd="$2"
-    local errfile="$3"
+    local errfile="$1"
+    shift
     local had_errexit=""
 
     case "$-" in
@@ -270,7 +351,7 @@ run_terminal_command() {
             ;;
     esac
 
-    $terminal $cmd 2>"$errfile"
+    "$@" 2>"$errfile"
     local rc=$?
 
     if [ -n "$had_errexit" ]; then
@@ -314,11 +395,25 @@ verify_window_opened() {
     return 2
 }
 
-# Launch terminal with given command.
-# Args: $1 = command to run inside terminal, $2 = window title (defaults to "shuttle")
+# Launch terminal with given command argv.
+# Args: $1 = window title, remaining args = command argv to run inside terminal.
 launch_terminal() {
-    local cmd="$1"
-    local title="${2:-shuttle}"
+    local title="${1:-shuttle}"
+    shift || true
+    if [ "$#" -eq 0 ]; then
+        echo "launch_terminal requires a command" >&2
+        return 1
+    fi
+    local attach_target=""
+    local previous_arg=""
+    local arg
+    for arg in "$@"; do
+        if [ "$previous_arg" = "-t" ]; then
+            attach_target="$arg"
+            break
+        fi
+        previous_arg="$arg"
+    done
     local errfile
     errfile=$(mktemp /tmp/shuttle-term-XXXXXX)
 
@@ -329,7 +424,7 @@ launch_terminal() {
     # path is dead — every new gnome-terminal client will fail with
     # "Failed to get screen from object path ..." even though the server is
     # perfectly healthy. Stripping the vars forces a fresh screen.
-    run_terminal_command "env -u GNOME_TERMINAL_SCREEN -u GNOME_TERMINAL_SERVICE gnome-terminal --title $title --" "$cmd" "$errfile"
+    run_terminal_command "$errfile" env -u GNOME_TERMINAL_SCREEN -u GNOME_TERMINAL_SERVICE gnome-terminal --title "$title" -- "$@"
     local rc=$?
     local used_fallback=""
 
@@ -340,7 +435,7 @@ launch_terminal() {
         if terminal_errors_are_dbus_stale "$errors"; then
             if command -v xterm >/dev/null 2>&1; then
                 : >"$errfile"
-                run_terminal_command "xterm -T $title -e" "$cmd" "$errfile"
+                run_terminal_command "$errfile" xterm -T "$title" -e "$@"
                 rc=$?
                 errors=$(cat "$errfile")
                 used_fallback=1
@@ -374,7 +469,11 @@ launch_terminal() {
         if [ $vrc -eq 2 ]; then
             echo "Warning: gnome-terminal returned success but no window titled '$title' appeared."
             echo "  gnome-terminal-server may be wedged. Try 'shuttle doctor' to diagnose."
-            echo "  Session is still running in tmux — attach with: tmux attach -t ${cmd##* }"
+            if [ -n "$attach_target" ]; then
+                echo "  Session is still running in tmux — attach with: tmux attach -t $attach_target"
+            else
+                echo "  Session is still running in tmux — attach manually"
+            fi
             return 1
         fi
     fi
@@ -626,7 +725,7 @@ case "$CMD" in
         if [ -n "$HEADLESS" ]; then
             tmux attach -t "=$SESSION"
         else
-            launch_terminal "tmux attach -t $SESSION" "shuttle:$SESSION"
+            launch_terminal "shuttle:$SESSION" tmux attach -t "=$SESSION"
         fi
         ;;
 
@@ -694,21 +793,8 @@ case "$CMD" in
 
         # Check session state before sending
         if [ "$PROVIDER" = "codex" ]; then
-            RECORD=$(record_for_session "$SESSION" || true)
-            if [ -z "$RECORD" ]; then
-                STATE="unknown"
-            else
-                IFS=$'\x1f' read -r -a RECORD_FIELDS <<< "$RECORD"
-                STATE="${RECORD_FIELDS[2]}"
-                PID="${RECORD_FIELDS[5]:-}"
-                if [ "$STATE" = "idle" ]; then
-                    if [ -z "$PID" ]; then
-                        STATE="stale"
-                    elif ! kill -0 "$PID" 2>/dev/null; then
-                        STATE="dead"
-                    fi
-                fi
-            fi
+            load_codex_send_record "$SESSION"
+            STATE="$CODEX_STATE"
         else
             NOW=$(date +%s)
             ACTIVITY=$(tmux list-sessions -F '#{session_name}|#{session_activity}' 2>/dev/null | grep -F "$SESSION|" | cut -d'|' -f2)
@@ -728,20 +814,8 @@ case "$CMD" in
                     exit 1
                 fi
                 if [ "$PROVIDER" = "codex" ]; then
-                    RECORD=$(record_for_session "$SESSION" || true)
-                    STATE="unknown"
-                    if [ -n "$RECORD" ]; then
-                        IFS=$'\x1f' read -r -a RECORD_FIELDS <<< "$RECORD"
-                        STATE="${RECORD_FIELDS[2]}"
-                        PID="${RECORD_FIELDS[5]:-}"
-                        if [ "$STATE" = "idle" ]; then
-                            if [ -z "$PID" ]; then
-                                STATE="stale"
-                            elif ! kill -0 "$PID" 2>/dev/null; then
-                                STATE="dead"
-                            fi
-                        fi
-                    fi
+                    load_codex_send_record "$SESSION"
+                    STATE="$CODEX_STATE"
                 else
                     NOW=$(date +%s)
                     IDLE=$((NOW - ACTIVITY))
@@ -785,8 +859,20 @@ case "$CMD" in
             exit 1
         fi
 
+        SEND_TARGET="$SESSION"
+        if [ "$PROVIDER" = "codex" ]; then
+            load_codex_send_record "$SESSION"
+            STATE="$CODEX_STATE"
+            if [ "$STATE" != "idle" ]; then
+                echo "Refusing to send to Codex while registry state is '$STATE'."
+                echo "Codex send requires a confirmed idle state; --force cannot override it."
+                exit 1
+            fi
+            verify_codex_send_pane "$SESSION" "$CODEX_PANE_ID" || exit $?
+            SEND_TARGET="$CODEX_PANE_ID"
+        fi
         echo "Sending to $SESSION: $MESSAGE"
-        tmux_send_cmd "$SESSION" "$MESSAGE"
+        tmux_send_cmd "$SEND_TARGET" "$MESSAGE"
 
         # Brief verification that something happened
         sleep 0.3
@@ -824,6 +910,8 @@ case "$CMD" in
         ;;
 
     relay)
+        claude_only_args relay "$@"
+        set -- "${CLAUDE_ARGS[@]}"
         NO_ENTER=""
         FORCE_SEND=""
         WAIT_FOR_PROMPT=""
@@ -862,16 +950,7 @@ case "$CMD" in
         TARGET="$1"
         FILE="$2"
 
-        if [[ "$TARGET" =~ ^[0-9]+$ ]]; then
-            SESSION=$(tmux ls 2>/dev/null | sed -n "${TARGET}p" | cut -d: -f1)
-        else
-            SESSION=$(tmux ls 2>/dev/null | grep "$TARGET" | head -1 | cut -d: -f1)
-        fi
-
-        if [ -z "$SESSION" ]; then
-            echo "Session not found: $TARGET"
-            exit 1
-        fi
+        SESSION=$(resolve_session "$TARGET" "claude") || exit $?
 
         # Read content from file or stdin
         if [ "$FILE" = "-" ]; then
@@ -933,7 +1012,7 @@ case "$CMD" in
 
         echo "Relaying to $SESSION ($SIZE bytes)..."
         if [ -n "$NO_ENTER" ]; then
-            tmux send-keys -t "$SESSION" -l -- "$CONTENT"
+            tmux send-keys -t "=$SESSION" -l -- "$CONTENT"
         else
             tmux_send_cmd "$SESSION" "$CONTENT"
         fi
@@ -1253,7 +1332,10 @@ case "$CMD" in
             CLAUDE_COMMAND=(claude --resume "$SESSION_ID")
             [ -z "$PROMPT" ] || CLAUDE_COMMAND+=("$PROMPT")
             printf -v RESUME_COMMAND '%q ' "${CLAUDE_COMMAND[@]}"
-            tmux new-session -d -s "$TMUX_SESSION" -c "$PROJECT_DIR" "$RESUME_COMMAND"
+            run_tmux_new_session "$TMUX_SESSION" "$PROJECT_DIR" "$RESUME_COMMAND"
+            if [ "$TMUX_NEW_SESSION_RC" -ne 0 ]; then
+                exit "$TMUX_NEW_SESSION_RC"
+            fi
         else
             [ -n "$PROJECT_DIR" ] || PROJECT_DIR="$(pwd)"
             TITLE="${META_TITLE:-resume-${SESSION_ID:0:8}}"
@@ -1277,7 +1359,11 @@ case "$CMD" in
             [ -z "$PROMPT" ] || CODEX_COMMAND+=("$PROMPT")
             SUPERVISOR=(env "PYTHONPATH=$SHUTTLE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m shuttlelib.supervisor --launch-id "$LAUNCH_ID" --tmux-session "$TMUX_SESSION" -- "${CODEX_COMMAND[@]}")
             printf -v RESUME_COMMAND '%q ' "${SUPERVISOR[@]}"
-            tmux new-session -d -s "$TMUX_SESSION" -c "$PROJECT_DIR" "$RESUME_COMMAND"
+            run_tmux_new_session "$TMUX_SESSION" "$PROJECT_DIR" "$RESUME_COMMAND"
+            if [ "$TMUX_NEW_SESSION_RC" -ne 0 ]; then
+                close_launch_failed "$LAUNCH_ID" "$TMUX_NEW_SESSION_RC" "tmux failed to create session $TMUX_SESSION"
+                exit "$TMUX_NEW_SESSION_RC"
+            fi
         fi
 
         echo "Resuming $AGENT session $SESSION_ID"
@@ -1286,7 +1372,7 @@ case "$CMD" in
         if [ -n "$HEADLESS" ] || [ -n "$SHUTTLE_HEADLESS" ] || [ -z "$DISPLAY" ]; then
             echo "Attach with: tmux attach -t $TMUX_SESSION"
         else
-            launch_terminal "tmux attach -t $TMUX_SESSION" "shuttle:$TMUX_SESSION"
+            launch_terminal "shuttle:$TMUX_SESSION" tmux attach -t "=$TMUX_SESSION"
             echo "Launched $TMUX_SESSION"
         fi
         ;;
@@ -1680,7 +1766,7 @@ $CONTENT
             if [ -n "$HEADLESS" ]; then
                 echo "Attach with: tmux attach -t $SESSION"
             else
-                launch_terminal "tmux attach -t $SESSION" "shuttle:$SESSION"
+                launch_terminal "shuttle:$SESSION" tmux attach -t "=$SESSION"
             fi
             exit 0
         fi
@@ -1703,9 +1789,10 @@ $CONTENT
         fi
         SUPERVISOR=(env "PYTHONPATH=$SHUTTLE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m shuttlelib.supervisor --launch-id "$LAUNCH_ID" --tmux-session "$SESSION" -- "${PROVIDER_COMMAND[@]}")
         printf -v SUPERVISOR_COMMAND '%q ' "${SUPERVISOR[@]}"
-        if ! tmux new-session -d -s "$SESSION" -c "$PROJECT_DIR" "$SUPERVISOR_COMMAND"; then
-            registry_cli degrade "$LAUNCH_ID" "tmux failed to create session $SESSION" || true
-            exit 1
+        run_tmux_new_session "$SESSION" "$PROJECT_DIR" "$SUPERVISOR_COMMAND"
+        if [ "$TMUX_NEW_SESSION_RC" -ne 0 ]; then
+            close_launch_failed "$LAUNCH_ID" "$TMUX_NEW_SESSION_RC" "tmux failed to create session $SESSION"
+            exit "$TMUX_NEW_SESSION_RC"
         fi
 
         if [ "$AGENT" = "claude" ]; then
@@ -1730,7 +1817,7 @@ $CONTENT
             echo "Session ready: $SESSION"
             echo "Attach with: tmux attach -t $SESSION"
         else
-            launch_terminal "tmux attach -t $SESSION" "shuttle:$SESSION"
+            launch_terminal "shuttle:$SESSION" tmux attach -t "=$SESSION"
             echo "Launched $SESSION"
         fi
         ;;

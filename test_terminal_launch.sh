@@ -82,17 +82,25 @@ run_test "healthy gnome-terminal launch passes title and does not fall back" '
     write_shim xterm '\''echo "xterm:$*" >>"'"$TMP_DIR"'/terminal.log"; exit 0'\''
     write_shim killall '\''echo "killall:$*" >>"'"$TMP_DIR"'/killall.log"; exit 0'\''
 
-    launch_terminal "tmux attach -t shuttle-test" "shuttle:shuttle-test" >"'"$TMP_DIR"'/output.log" 2>&1
-    assert_contains "'"$TMP_DIR"'/terminal.log" "gnome-terminal:--title shuttle:shuttle-test -- tmux attach -t shuttle-test" &&
+    launch_terminal "shuttle:shuttle-test" tmux attach -t "=shuttle-test" >"'"$TMP_DIR"'/output.log" 2>&1
+    assert_contains "'"$TMP_DIR"'/terminal.log" "gnome-terminal:--title shuttle:shuttle-test -- tmux attach -t =shuttle-test" &&
     ! assert_contains "'"$TMP_DIR"'/terminal.log" "xterm:" &&
     assert_not_exists "'"$TMP_DIR"'/killall.log"
 '
 
-run_test "default title is \"shuttle\" when caller omits second arg" '
+run_test "default title is \"shuttle\" when caller passes empty title" '
     write_shim gnome-terminal '\''echo "gnome-terminal:$*" >>"'"$TMP_DIR"'/terminal.log"; exit 0'\''
 
-    launch_terminal "tmux attach -t shuttle-test" >"'"$TMP_DIR"'/output.log" 2>&1
-    assert_contains "'"$TMP_DIR"'/terminal.log" "gnome-terminal:--title shuttle -- tmux attach -t shuttle-test"
+    launch_terminal "" tmux attach -t "=shuttle-test" >"'"$TMP_DIR"'/output.log" 2>&1
+    assert_contains "'"$TMP_DIR"'/terminal.log" "gnome-terminal:--title shuttle -- tmux attach -t =shuttle-test"
+'
+
+run_test "argv launch keeps spaced attach target as one argument" '
+    write_shim gnome-terminal '\''printf "%s\n" "$#" "$@" >"'"$TMP_DIR"'/terminal.log"; exit 0'\''
+
+    launch_terminal "shuttle:spaced session" tmux attach -t "=spaced session" >"'"$TMP_DIR"'/output.log" 2>&1
+    assert_contains "'"$TMP_DIR"'/terminal.log" "7" &&
+    assert_contains "'"$TMP_DIR"'/terminal.log" "=spaced session"
 '
 
 run_test "D-Bus failure falls back to xterm with title flag, no killall" '
@@ -100,8 +108,8 @@ run_test "D-Bus failure falls back to xterm with title flag, no killall" '
     write_shim xterm '\''echo "xterm:$*" >>"'"$TMP_DIR"'/terminal.log"; exit 0'\''
     write_shim killall '\''echo "killall:$*" >>"'"$TMP_DIR"'/killall.log"; exit 0'\''
 
-    launch_terminal "tmux attach -t shuttle-test" "shuttle:shuttle-test" >"'"$TMP_DIR"'/output.log" 2>&1
-    assert_contains "'"$TMP_DIR"'/terminal.log" "xterm:-T shuttle:shuttle-test -e tmux attach -t shuttle-test" &&
+    launch_terminal "shuttle:shuttle-test" tmux attach -t "=shuttle-test" >"'"$TMP_DIR"'/output.log" 2>&1
+    assert_contains "'"$TMP_DIR"'/terminal.log" "xterm:-T shuttle:shuttle-test -e tmux attach -t =shuttle-test" &&
     assert_not_exists "'"$TMP_DIR"'/killall.log" &&
     [ ! -s "'"$TMP_DIR"'/output.log" ]
 '
@@ -112,7 +120,7 @@ run_test "D-Bus failure without xterm reports manual recovery and returns nonzer
 
     rm -f "'"$TMP_DIR"'/bin/xterm"
     set +e
-    launch_terminal "tmux attach -t shuttle-test" "shuttle:shuttle-test" >"'"$TMP_DIR"'/output.log" 2>&1
+    launch_terminal "shuttle:shuttle-test" tmux attach -t "=shuttle-test" >"'"$TMP_DIR"'/output.log" 2>&1
     rc=$?
     set -e
 
@@ -128,7 +136,7 @@ run_test "window verification flags missing window when wmctrl is present" '
     write_shim wmctrl '\''echo "wmctrl:$*" >>"'"$TMP_DIR"'/wmctrl.log"; echo "0x01 0 host other-window"; exit 0'\''
 
     set +e
-    launch_terminal "tmux attach -t shuttle-test" "shuttle:shuttle-test" >"'"$TMP_DIR"'/output.log" 2>&1
+    launch_terminal "shuttle:shuttle-test" tmux attach -t "=shuttle-test" >"'"$TMP_DIR"'/output.log" 2>&1
     rc=$?
     set -e
 
@@ -142,7 +150,7 @@ run_test "window verification passes when wmctrl finds the title" '
     write_shim wmctrl '\''echo "0x01 0 host shuttle:shuttle-test"; exit 0'\''
 
     set +e
-    launch_terminal "tmux attach -t shuttle-test" "shuttle:shuttle-test" >"'"$TMP_DIR"'/output.log" 2>&1
+    launch_terminal "shuttle:shuttle-test" tmux attach -t "=shuttle-test" >"'"$TMP_DIR"'/output.log" 2>&1
     rc=$?
     set -e
 
@@ -155,7 +163,7 @@ run_test "SHUTTLE_SKIP_WINDOW_CHECK skips verification" '
     write_shim wmctrl '\''echo "0x01 0 host other-window"; exit 0'\''
 
     set +e
-    SHUTTLE_SKIP_WINDOW_CHECK=1 launch_terminal "tmux attach -t shuttle-test" "shuttle:shuttle-test" >"'"$TMP_DIR"'/output.log" 2>&1
+    SHUTTLE_SKIP_WINDOW_CHECK=1 launch_terminal "shuttle:shuttle-test" tmux attach -t "=shuttle-test" >"'"$TMP_DIR"'/output.log" 2>&1
     rc=$?
     set -e
 
@@ -170,7 +178,7 @@ run_test "GNOME_TERMINAL_SCREEN is stripped from gnome-terminal env" '
     GNOME_TERMINAL_SCREEN=/org/gnome/Terminal/screen/stale_handle \
     GNOME_TERMINAL_SERVICE=:1.99 \
     SHUTTLE_SKIP_WINDOW_CHECK=1 \
-    launch_terminal "tmux attach -t shuttle-test" "shuttle:shuttle-test" >"'"$TMP_DIR"'/output.log" 2>&1
+    launch_terminal "shuttle:shuttle-test" tmux attach -t "=shuttle-test" >"'"$TMP_DIR"'/output.log" 2>&1
     rc=$?
     set -e
 
