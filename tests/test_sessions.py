@@ -70,6 +70,25 @@ def test_native_binding_is_idempotent_and_immutable(
     assert registry.get(launch["launch_id"])["native_session_id"] == "native-1"
 
 
+def test_location_binding_is_exact_idempotent_and_immutable(
+    registry: Registry, launch: dict
+) -> None:
+    registry.bind_location(
+        launch["launch_id"],
+        tmux_session="shuttle-registry",
+        pane_id="%7",
+        pid=12345,
+    )
+
+    with pytest.raises(BindingConflict):
+        registry.bind_location(
+            launch["launch_id"],
+            tmux_session="shuttle-registry",
+            pane_id="%8",
+            pid=12345,
+        )
+
+
 def test_concurrent_binding_has_one_winner(registry: Registry, launch: dict) -> None:
     def bind(native_id: str) -> str:
         try:

@@ -1,19 +1,22 @@
 #!/bin/bash
-# shuttle - CLI for managing Claude Code agent sessions
+# shuttle - CLI for managing Claude and Codex agent sessions
 # Usage: shuttle [command] [args]
 
 set -e
 
 # Resolve the directory containing this script (for finding sibling modules)
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+SHUTTLE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
 # Default configuration values
+ENV_SHUTTLE_DEFAULT_AGENT="${SHUTTLE_DEFAULT_AGENT:-}"
 SHUTTLE_DEFAULT_PROJECT=""           # Default project directory (empty = use pwd)
 SHUTTLE_DEFAULT_SITE="ledger"        # Default site for briefs
+SHUTTLE_DEFAULT_AGENT="claude"       # Default interactive provider
 SHUTTLE_HEADLESS_DEFAULT=""          # Default headless mode (empty = auto-detect)
 SHUTTLE_PROMPT_TIMEOUT=12            # Seconds to wait for Claude prompt
 
@@ -45,6 +48,8 @@ load_config() {
 # Load config at startup (before any command processing)
 load_config
 
+[ -n "$ENV_SHUTTLE_DEFAULT_AGENT" ] && SHUTTLE_DEFAULT_AGENT="$ENV_SHUTTLE_DEFAULT_AGENT"
+
 # Apply environment variable overrides (higher precedence than config file)
 [ -n "$SHUTTLE_PROJECT" ] && SHUTTLE_DEFAULT_PROJECT="$SHUTTLE_PROJECT"
 [ -n "$SHUTTLE_SITE" ] && SHUTTLE_DEFAULT_SITE="$SHUTTLE_SITE"
@@ -54,13 +59,14 @@ load_config
 # Helper Functions
 # =============================================================================
 
-# Parse --dir, --project, and --headless options
-# Sets: PROJECT_DIR, HEADLESS, remaining args in POSITIONAL array
+# Parse --dir, --project, --agent, and --headless options
+# Sets: PROJECT_DIR, HEADLESS, AGENT, remaining args in POSITIONAL array
 parse_project_opts() {
     PROJECT_DIR=""
     PROJECT_NAME=""
     EXPLICIT_DIR=""
     HEADLESS=""
+    AGENT="$SHUTTLE_DEFAULT_AGENT"
     POSITIONAL=()
 
     while [[ $# -gt 0 ]]; do
@@ -78,12 +84,18 @@ parse_project_opts() {
                 HEADLESS=1
                 shift
                 ;;
+            --agent)
+                AGENT="$2"
+                shift 2
+                ;;
             *)
                 POSITIONAL+=("$1")
                 shift
                 ;;
         esac
     done
+
+    validate_agent "$AGENT"
 
     # Error if both set
     if [ -n "$PROJECT_DIR" ] && [ -n "$PROJECT_NAME" ]; then
@@ -119,6 +131,108 @@ parse_project_opts() {
     fi
 }
 
+validate_agent() {
+    case "$1" in
+        claude|codex) ;;
+        *)
+            echo "Error: --agent must be claude or codex"
+            exit 1
+            ;;
+    esac
+}
+
+claude_only_args() {
+    local command="$1"
+    shift
+    CLAUDE_ARGS=()
+    while [[ $# -gt 0 ]]; do
+        if [ "$1" = "--agent" ]; then
+            validate_agent "$2"
+            if [ "$2" != "claude" ]; then
+                echo "Error: shuttle $command is Claude-only in this release"
+                exit 1
+            fi
+            shift 2
+        else
+            CLAUDE_ARGS+=("$1")
+            shift
+        fi
+    done
+}
+
+registry_cli() {
+    PYTHONPATH="$SHUTTLE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m shuttlelib.cli "$@"
+}
+
+record_for_session() {
+    registry_cli lookup-tmux --live "$1" 2>/dev/null
+}
+
+provider_for_session() {
+    local record
+    record=$(record_for_session "$1" || true)
+    if [ -n "$record" ]; then
+        echo "$record" | cut -d $'\x1f' -f2
+    elif [[ "$1" == shuttle-codex-* ]]; then
+        echo "codex"
+    else
+        echo "claude"
+    fi
+}
+
+# Resolve a human target without ever silently choosing among partial matches.
+# Exact tmux names win, numeric targets are positional convenience, and a
+# partial name must identify exactly one provider-compatible session.
+resolve_session() {
+    local target="$1"
+    local requested_agent="${2:-}"
+    local names=()
+    local matches=()
+    local name provider
+    mapfile -t names < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
+
+    if [[ "$target" =~ ^[0-9]+$ ]]; then
+        name="${names[$((target - 1))]:-}"
+        if [ -z "$name" ]; then
+            echo "Session not found: $target" >&2
+            return 1
+        fi
+        if [ -n "$requested_agent" ] && [ "$(provider_for_session "$name")" != "$requested_agent" ]; then
+            echo "Session '$name' is not a $requested_agent session" >&2
+            return 1
+        fi
+        echo "$name"
+        return 0
+    fi
+
+    for name in "${names[@]}"; do
+        if [ "$name" = "$target" ]; then
+            if [ -n "$requested_agent" ] && [ "$(provider_for_session "$name")" != "$requested_agent" ]; then
+                echo "Session '$name' is not a $requested_agent session" >&2
+                return 1
+            fi
+            echo "$name"
+            return 0
+        fi
+    done
+
+    for name in "${names[@]}"; do
+        [[ "$name" == *"$target"* ]] || continue
+        provider=$(provider_for_session "$name")
+        [ -z "$requested_agent" ] || [ "$provider" = "$requested_agent" ] || continue
+        matches+=("$name")
+    done
+    if [ "${#matches[@]}" -eq 0 ]; then
+        echo "Session not found: $target" >&2
+        return 1
+    fi
+    if [ "${#matches[@]}" -ne 1 ]; then
+        echo "Ambiguous session target '$target': ${matches[*]}" >&2
+        return 2
+    fi
+    echo "${matches[0]}"
+}
+
 # Send a message to a tmux pane and press Enter
 # Usage: tmux_send_cmd <target> <message>
 # NOTE: Must use two separate send-keys calls when using -t target!
@@ -126,9 +240,11 @@ parse_project_opts() {
 tmux_send_cmd() {
     local target="$1"
     local message="$2"
-    tmux send-keys -t "$target" "$message"
+    local exact_target="=$target"
+    [[ "$target" == %* ]] && exact_target="$target"
+    tmux send-keys -t "$exact_target" -l -- "$message"
     sleep 0.3
-    tmux send-keys -t "$target" Enter
+    tmux send-keys -t "$exact_target" Enter
 }
 
 terminal_errors_are_dbus_stale() {
@@ -293,7 +409,7 @@ detect_session_state() {
 
     # Capture last 30 lines from the pane
     local content
-    content=$(tmux capture-pane -t "$session" -p 2>/dev/null | tail -30)
+    content=$(tmux capture-pane -t "=$session" -p 2>/dev/null | tail -30)
 
     if [ -z "$content" ]; then
         echo "unknown"
@@ -343,9 +459,13 @@ format_state() {
     local state="$1"
     case "$state" in
         running)  echo "⏳" ;;  # Tool is running (waiting for output)
+        starting) echo "⏳" ;;
         thinking) echo "🧠" ;;  # Claude is thinking/processing (before tool call)
+        working)  echo "🧠" ;;
         approval) echo "🔒" ;;  # Waiting for user permission
         waiting)  echo "💤" ;;  # At prompt, waiting for input
+        idle)     echo "💤" ;;
+        dead|stale) echo "⚠️ " ;;
         stuck)    echo "⚠️ " ;; # Idle too long with unclear state
         *)        echo "○" ;;   # Unknown state
     esac
@@ -356,6 +476,20 @@ shift 2>/dev/null || true
 
 case "$CMD" in
     status)
+        STATUS_AGENT=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --agent)
+                    STATUS_AGENT="$2"
+                    validate_agent "$STATUS_AGENT"
+                    shift 2
+                    ;;
+                *)
+                    echo "Usage: shuttle status [--agent claude|codex]"
+                    exit 1
+                    ;;
+            esac
+        done
         # Start slow skein calls in parallel
         BRIEFS_TMP=$(mktemp)
         SHARDS_TMP=$(mktemp)
@@ -370,11 +504,18 @@ case "$CMD" in
         echo "SESSIONS:"
         NOW=$(date +%s)
         SESSIONS=$(tmux list-sessions -F '#{session_name}|#{session_attached}|#{session_activity}' 2>/dev/null || true)
+        declare -A SEEN_SESSIONS=()
         if [ -z "$SESSIONS" ]; then
-            echo "  (none)"
+            :
         else
             i=1
             while IFS='|' read -r NAME ATTACHED ACTIVITY; do
+                PROVIDER=$(provider_for_session "$NAME")
+                if [ -n "$STATUS_AGENT" ] && [ "$PROVIDER" != "$STATUS_AGENT" ]; then
+                    ((i++))
+                    continue
+                fi
+                SEEN_SESSIONS["$NAME"]=1
                 IDLE=$((NOW - ACTIVITY))
                 AGE=$(format_age $IDLE)
                 if [ "$ATTACHED" -eq 1 ]; then
@@ -382,12 +523,48 @@ case "$CMD" in
                 else
                     ATTACH_STR="detached"
                 fi
-                # Detect session state from pane content
-                STATE=$(detect_session_state "$NAME" "$IDLE")
+                RECORD=$(record_for_session "$NAME" || true)
+                if [ -n "$RECORD" ]; then
+                    IFS=$'\x1f' read -r -a RECORD_FIELDS <<< "$RECORD"
+                    STATE="${RECORD_FIELDS[2]}"
+                    PID="${RECORD_FIELDS[5]}"
+                    PROCESS_STR="dead"
+                    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+                        PROCESS_STR="live"
+                    fi
+                    EXISTENCE="session=live process=$PROCESS_STR"
+                    if [ "$PROVIDER" = "claude" ]; then
+                        STATE=$(detect_session_state "$NAME" "$IDLE")
+                    fi
+                else
+                    STATE=$(detect_session_state "$NAME" "$IDLE")
+                    EXISTENCE="session=live process=unknown"
+                fi
                 INDICATOR=$(format_state "$STATE")
-                printf "  [%d] %-30s (%s)  %4s %s\n" "$i" "$NAME" "$ATTACH_STR" "$AGE" "$INDICATOR"
+                printf "  [%d] %-30s [%s] (%s; %s) %4s %s %s\n" "$i" "$NAME" "$PROVIDER" "$ATTACH_STR" "$EXISTENCE" "$AGE" "$INDICATOR" "$STATE"
                 ((i++))
             done <<< "$SESSIONS"
+        fi
+
+        LIVE_RECORDS=$(registry_cli records --live 2>/dev/null || true)
+        while IFS= read -r REGISTRY_LINE; do
+            IFS=$'\x1f' read -r -a RECORD_FIELDS <<< "$REGISTRY_LINE"
+            PROVIDER="${RECORD_FIELDS[1]:-}"
+            STATE="${RECORD_FIELDS[2]:-}"
+            NAME="${RECORD_FIELDS[3]:-}"
+            PID="${RECORD_FIELDS[5]:-}"
+            [ -n "$NAME" ] || continue
+            [ -z "$STATUS_AGENT" ] || [ "$PROVIDER" = "$STATUS_AGENT" ] || continue
+            [ -z "${SEEN_SESSIONS[$NAME]:-}" ] || continue
+            PROCESS_STR="dead"
+            if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+                PROCESS_STR="live"
+            fi
+            INDICATOR=$(format_state "stale")
+            printf "  [-] %-30s [%s] (session=dead; process=%s)    %s stale (registry: %s)\n" "$NAME" "$PROVIDER" "$PROCESS_STR" "$INDICATOR" "$STATE"
+        done <<< "$LIVE_RECORDS"
+        if [ -z "$SESSIONS" ] && [ -z "$LIVE_RECORDS" ]; then
+            echo "  (none)"
         fi
         echo ""
 
@@ -425,12 +602,13 @@ case "$CMD" in
         # Check for --headless flag
         HEADLESS=""
         TARGET=""
-        for arg in "$@"; do
-            if [ "$arg" = "--headless" ]; then
-                HEADLESS=1
-            else
-                TARGET="$arg"
-            fi
+        AGENT=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --headless) HEADLESS=1; shift ;;
+                --agent) AGENT="$2"; validate_agent "$AGENT"; shift 2 ;;
+                *) TARGET="$1"; shift ;;
+            esac
         done
         # Also check env var and display
         if [ -n "$SHUTTLE_HEADLESS" ] || [ -z "$DISPLAY" ]; then
@@ -442,44 +620,33 @@ case "$CMD" in
             exit 1
         fi
 
-        if [[ "$TARGET" =~ ^[0-9]+$ ]]; then
-            SESSION=$(tmux ls 2>/dev/null | sed -n "${TARGET}p" | cut -d: -f1)
-        else
-            SESSION=$(tmux ls 2>/dev/null | grep "$TARGET" | head -1 | cut -d: -f1)
-        fi
-
-        if [ -z "$SESSION" ]; then
-            echo "Session not found: $TARGET"
-            exit 1
-        fi
+        SESSION=$(resolve_session "$TARGET" "$AGENT") || exit $?
 
         echo "Boarding $SESSION..."
         if [ -n "$HEADLESS" ]; then
-            tmux attach -t "$SESSION"
+            tmux attach -t "=$SESSION"
         else
             launch_terminal "tmux attach -t $SESSION" "shuttle:$SESSION"
         fi
         ;;
 
     kill|k)
-        if [ -z "$1" ]; then
-            echo "Usage: shuttle kill <number|name>"
+        AGENT=""
+        TARGET=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --agent) AGENT="$2"; validate_agent "$AGENT"; shift 2 ;;
+                *) TARGET="$1"; shift ;;
+            esac
+        done
+        if [ -z "$TARGET" ]; then
+            echo "Usage: shuttle kill [--agent claude|codex] <number|name>"
             exit 1
         fi
-
-        if [[ "$1" =~ ^[0-9]+$ ]]; then
-            SESSION=$(tmux ls 2>/dev/null | sed -n "${1}p" | cut -d: -f1)
-        else
-            SESSION=$(tmux ls 2>/dev/null | grep "$1" | head -1 | cut -d: -f1)
-        fi
-
-        if [ -z "$SESSION" ]; then
-            echo "Session not found: $1"
-            exit 1
-        fi
+        SESSION=$(resolve_session "$TARGET" "$AGENT") || exit $?
 
         echo "Killing $SESSION..."
-        tmux kill-session -t "$SESSION"
+        tmux kill-session -t "=$SESSION"
         echo "Done."
         ;;
 
@@ -487,6 +654,7 @@ case "$CMD" in
         # Parse options
         FORCE_SEND=""
         WAIT_FOR_PROMPT=""
+        AGENT=""
         POSITIONAL=()
         while [[ $# -gt 0 ]]; do
             case "$1" in
@@ -497,6 +665,11 @@ case "$CMD" in
                 --wait|-w)
                     WAIT_FOR_PROMPT=1
                     shift
+                    ;;
+                --agent)
+                    AGENT="$2"
+                    validate_agent "$AGENT"
+                    shift 2
                     ;;
                 *)
                     POSITIONAL+=("$1")
@@ -516,45 +689,72 @@ case "$CMD" in
         TARGET="$1"
         MESSAGE="$2"
 
-        if [[ "$TARGET" =~ ^[0-9]+$ ]]; then
-            SESSION=$(tmux ls 2>/dev/null | sed -n "${TARGET}p" | cut -d: -f1)
-        else
-            SESSION=$(tmux ls 2>/dev/null | grep "$TARGET" | head -1 | cut -d: -f1)
-        fi
-
-        if [ -z "$SESSION" ]; then
-            echo "Session not found: $TARGET"
-            exit 1
-        fi
+        SESSION=$(resolve_session "$TARGET" "$AGENT") || exit $?
+        PROVIDER=$(provider_for_session "$SESSION")
 
         # Check session state before sending
-        NOW=$(date +%s)
-        ACTIVITY=$(tmux list-sessions -F '#{session_name}|#{session_activity}' 2>/dev/null | grep -F "$SESSION|" | cut -d'|' -f2)
-        IDLE=$((NOW - ACTIVITY))
-        STATE=$(detect_session_state "$SESSION" "$IDLE")
+        if [ "$PROVIDER" = "codex" ]; then
+            RECORD=$(record_for_session "$SESSION" || true)
+            if [ -z "$RECORD" ]; then
+                STATE="unknown"
+            else
+                IFS=$'\x1f' read -r -a RECORD_FIELDS <<< "$RECORD"
+                STATE="${RECORD_FIELDS[2]}"
+                PID="${RECORD_FIELDS[5]:-}"
+                if [ "$STATE" = "idle" ]; then
+                    if [ -z "$PID" ]; then
+                        STATE="stale"
+                    elif ! kill -0 "$PID" 2>/dev/null; then
+                        STATE="dead"
+                    fi
+                fi
+            fi
+        else
+            NOW=$(date +%s)
+            ACTIVITY=$(tmux list-sessions -F '#{session_name}|#{session_activity}' 2>/dev/null | grep -F "$SESSION|" | cut -d'|' -f2)
+            IDLE=$((NOW - ACTIVITY))
+            STATE=$(detect_session_state "$SESSION" "$IDLE")
+        fi
 
         if [ -n "$WAIT_FOR_PROMPT" ]; then
             # Wait for session to reach prompt state (use configured timeout)
             WAIT_ITERATIONS=$((SHUTTLE_PROMPT_TIMEOUT * 2))  # 2 checks per second
             echo "Waiting for $SESSION to reach prompt..."
             for ((i=1; i<=WAIT_ITERATIONS; i++)); do
-                NOW=$(date +%s)
                 ACTIVITY=$(tmux list-sessions -F '#{session_name}|#{session_activity}' 2>/dev/null | grep -F "$SESSION|" | cut -d'|' -f2)
                 # Detect session disappearance
                 if [ -z "$ACTIVITY" ]; then
                     echo "Error: Session '$SESSION' no longer exists"
                     exit 1
                 fi
-                IDLE=$((NOW - ACTIVITY))
-                STATE=$(detect_session_state "$SESSION" "$IDLE")
-                if [ "$STATE" = "waiting" ]; then
+                if [ "$PROVIDER" = "codex" ]; then
+                    RECORD=$(record_for_session "$SESSION" || true)
+                    STATE="unknown"
+                    if [ -n "$RECORD" ]; then
+                        IFS=$'\x1f' read -r -a RECORD_FIELDS <<< "$RECORD"
+                        STATE="${RECORD_FIELDS[2]}"
+                        PID="${RECORD_FIELDS[5]:-}"
+                        if [ "$STATE" = "idle" ]; then
+                            if [ -z "$PID" ]; then
+                                STATE="stale"
+                            elif ! kill -0 "$PID" 2>/dev/null; then
+                                STATE="dead"
+                            fi
+                        fi
+                    fi
+                else
+                    NOW=$(date +%s)
+                    IDLE=$((NOW - ACTIVITY))
+                    STATE=$(detect_session_state "$SESSION" "$IDLE")
+                fi
+                if { [ "$PROVIDER" = "codex" ] && [ "$STATE" = "idle" ]; } || { [ "$PROVIDER" = "claude" ] && [ "$STATE" = "waiting" ]; }; then
                     break
                 fi
                 sleep 0.5
             done
-            if [ "$STATE" != "waiting" ]; then
+            if { [ "$PROVIDER" = "codex" ] && [ "$STATE" != "idle" ]; } || { [ "$PROVIDER" = "claude" ] && [ "$STATE" != "waiting" ]; }; then
                 echo "Warning: Timed out waiting for prompt (state: $STATE)"
-                if [ -z "$FORCE_SEND" ]; then
+                if [ -z "$FORCE_SEND" ] || [ "$PROVIDER" = "codex" ]; then
                     echo "Use --force to send anyway"
                     exit 1
                 fi
@@ -562,7 +762,12 @@ case "$CMD" in
         fi
 
         # Warn if not at prompt (unless forced)
-        if [ "$STATE" != "waiting" ] && [ -z "$FORCE_SEND" ]; then
+        if [ "$PROVIDER" = "codex" ] && [ "$STATE" != "idle" ]; then
+            echo "Refusing to send to Codex while registry state is '$STATE'."
+            echo "Codex send requires a confirmed idle state; --force cannot override it."
+            exit 1
+        fi
+        if [ "$PROVIDER" = "claude" ] && [ "$STATE" != "waiting" ] && [ -z "$FORCE_SEND" ]; then
             INDICATOR=$(format_state "$STATE")
             echo "Warning: Session is not at prompt ($INDICATOR $STATE)"
             case "$STATE" in
@@ -585,7 +790,16 @@ case "$CMD" in
 
         # Brief verification that something happened
         sleep 0.3
-        NEW_STATE=$(detect_session_state "$SESSION" 0)
+        if [ "$PROVIDER" = "codex" ]; then
+            NEW_STATE="unknown"
+            RECORD=$(record_for_session "$SESSION" || true)
+            if [ -n "$RECORD" ]; then
+                IFS=$'\x1f' read -r -a RECORD_FIELDS <<< "$RECORD"
+                NEW_STATE="${RECORD_FIELDS[2]}"
+            fi
+        else
+            NEW_STATE=$(detect_session_state "$SESSION" 0)
+        fi
         case "$NEW_STATE" in
             working)
                 echo "✓ Claude is processing your message"
@@ -719,7 +933,7 @@ case "$CMD" in
 
         echo "Relaying to $SESSION ($SIZE bytes)..."
         if [ -n "$NO_ENTER" ]; then
-            tmux send-keys -t "$SESSION" "$CONTENT"
+            tmux send-keys -t "$SESSION" -l -- "$CONTENT"
         else
             tmux_send_cmd "$SESSION" "$CONTENT"
         fi
@@ -727,6 +941,8 @@ case "$CMD" in
         ;;
 
     context|ctx)
+        claude_only_args context "$@"
+        set -- "${CLAUDE_ARGS[@]}"
         TARGET="${1:-1}"
         LAST_N="${2:-10}"
 
@@ -801,6 +1017,8 @@ case "$CMD" in
         ;;
 
     search)
+        claude_only_args search "$@"
+        set -- "${CLAUDE_ARGS[@]}"
         SHUTTLE_INDEX_FILE="$HOME/.shuttle/index.json"
         CC_PROJECTS="$HOME/.claude/projects"
 
@@ -959,50 +1177,112 @@ case "$CMD" in
         ;;
 
     resume)
-        if [ -z "$1" ]; then
-            echo "Usage: shuttle resume <session-id>"
-            echo "  Resume a CC session by UUID (from shuttle search)"
+        AGENT=""
+        HEADLESS=""
+        PROJECT_DIR=""
+        HANDOFF=""
+        POSITIONAL=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --agent) AGENT="$2"; validate_agent "$AGENT"; shift 2 ;;
+                --headless) HEADLESS=1; shift ;;
+                -d|--dir) PROJECT_DIR="$2"; shift 2 ;;
+                -p|--project) PROJECT_DIR="$HOME/projects/$2"; shift 2 ;;
+                --handoff) HANDOFF="HANDOFF: $2"; shift 2 ;;
+                *) POSITIONAL+=("$1"); shift ;;
+            esac
+        done
+        SESSION_ID="${POSITIONAL[0]:-}"
+        PROMPT="${POSITIONAL[1]:-$HANDOFF}"
+        if [ -z "$SESSION_ID" ]; then
+            echo "Usage: shuttle resume [--agent claude|codex] [--handoff BRIEF] <session-id> [prompt]"
             exit 1
         fi
 
-        SESSION_ID="$1"
-        CC_PROJECTS="$HOME/.claude/projects"
-
-        # Find which project contains this session
-        SESSION_FILE=$(find "$CC_PROJECTS" -name "${SESSION_ID}.jsonl" -type f 2>/dev/null | head -1)
-
-        if [ -z "$SESSION_FILE" ]; then
-            echo "Session not found: $SESSION_ID"
-            echo "Use 'shuttle search' to find valid session IDs"
-            exit 1
+        METADATA=$(registry_cli lookup-native "$SESSION_ID" 2>/dev/null || true)
+        if [ -n "$METADATA" ]; then
+            IFS=$'\x1f' read -r -a META_FIELDS <<< "$METADATA"
+            META_PROVIDER="${META_FIELDS[1]}"
+            META_STATE="${META_FIELDS[2]}"
+            META_TMUX="${META_FIELDS[3]}"
+            META_CWD="${META_FIELDS[6]}"
+            META_BRIEF="${META_FIELDS[7]}"
+            META_TITLE="${META_FIELDS[8]}"
+            if [ -n "$AGENT" ] && [ "$AGENT" != "$META_PROVIDER" ]; then
+                echo "Session $SESSION_ID belongs to provider $META_PROVIDER, not $AGENT"
+                exit 1
+            fi
+            AGENT="$META_PROVIDER"
+            [ -n "$PROJECT_DIR" ] || PROJECT_DIR="$META_CWD"
+            if [ "$META_STATE" != "closed" ] && [ -n "$META_TMUX" ] && tmux has-session -t "=$META_TMUX" 2>/dev/null; then
+                ATTACHED=$(tmux display-message -p -t "=$META_TMUX" '#{session_attached}' 2>/dev/null || echo 0)
+                if [ "${ATTACHED:-0}" -gt 0 ]; then
+                    echo "Refusing to resume: $META_TMUX is already live and attached"
+                    exit 1
+                fi
+                echo "Session is already live and detached: $META_TMUX"
+                echo "Attach with: tmux attach -t $META_TMUX"
+                exit 0
+            fi
         fi
 
-        # Extract project path from encoded folder name
-        # ~/.claude/projects/-home-patrick-projects-foo/uuid.jsonl → /home/patrick/projects/foo
-        ENCODED_PATH=$(basename "$(dirname "$SESSION_FILE")")
-        PROJECT_DIR=$(echo "$ENCODED_PATH" | sed 's/^-//; s/-/\//g')
-        PROJECT_DIR="/$PROJECT_DIR"
-
-        if [ ! -d "$PROJECT_DIR" ]; then
-            echo "Project directory not found: $PROJECT_DIR"
-            exit 1
+        if [ -z "$AGENT" ]; then
+            CC_PROJECTS="$HOME/.claude/projects"
+            SESSION_FILE=$(find "$CC_PROJECTS" -name "${SESSION_ID}.jsonl" -type f 2>/dev/null | head -1)
+            if [ -z "$SESSION_FILE" ]; then
+                echo "Unknown session identity: $SESSION_ID"
+                echo "Raw Codex UUIDs require: shuttle resume --agent codex $SESSION_ID"
+                exit 1
+            fi
+            AGENT="claude"
         fi
 
-        # Create session name from project
-        PROJECT_NAME=$(basename "$PROJECT_DIR")
-        TMUX_SESSION="resume-${PROJECT_NAME}-${SESSION_ID:0:8}"
+        if [ "$AGENT" = "claude" ]; then
+            CC_PROJECTS="$HOME/.claude/projects"
+            SESSION_FILE=$(find "$CC_PROJECTS" -name "${SESSION_ID}.jsonl" -type f 2>/dev/null | head -1)
+            if [ -z "$SESSION_FILE" ]; then
+                echo "Claude session not found: $SESSION_ID"
+                exit 1
+            fi
+            if [ -z "$PROJECT_DIR" ]; then
+                ENCODED_PATH=$(basename "$(dirname "$SESSION_FILE")")
+                PROJECT_DIR="/$(echo "$ENCODED_PATH" | sed 's/^-//; s/-/\//g')"
+            fi
+            PROJECT_NAME=$(basename "$PROJECT_DIR")
+            TMUX_SESSION="resume-${PROJECT_NAME}-${SESSION_ID:0:8}"
+            CLAUDE_COMMAND=(claude --resume "$SESSION_ID")
+            [ -z "$PROMPT" ] || CLAUDE_COMMAND+=("$PROMPT")
+            printf -v RESUME_COMMAND '%q ' "${CLAUDE_COMMAND[@]}"
+            tmux new-session -d -s "$TMUX_SESSION" -c "$PROJECT_DIR" "$RESUME_COMMAND"
+        else
+            [ -n "$PROJECT_DIR" ] || PROJECT_DIR="$(pwd)"
+            TITLE="${META_TITLE:-resume-${SESSION_ID:0:8}}"
+            TITLE=$(echo "$TITLE" | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g' | sed 's/--*/-/g' | cut -c1-25)
+            TMUX_SESSION="shuttle-codex-${TITLE:-resume-${SESSION_ID:0:8}}"
+            if tmux has-session -t "=$TMUX_SESSION" 2>/dev/null; then
+                echo "Session already exists: $TMUX_SESSION"
+                exit 1
+            fi
+            PROVIDER_VERSION=$(codex --version 2>/dev/null | head -1 | awk '{print $NF}' || true)
+            CREATE_ARGS=(create --provider codex --provider-version "${PROVIDER_VERSION:-unknown}" --mode resume --cwd "$PROJECT_DIR" --tmux-session "$TMUX_SESSION" --resume-of "$SESSION_ID")
+            [ -z "${META_BRIEF:-}" ] || CREATE_ARGS+=(--brief "$META_BRIEF")
+            [ -z "${META_TITLE:-}" ] || CREATE_ARGS+=(--title "$META_TITLE")
+            LAUNCH_ID=$(registry_cli "${CREATE_ARGS[@]}")
+            if ! registry_cli hooks-doctor --quiet; then
+                echo "Warning: Shuttle's Codex hooks are missing, differ, or are untrusted." >&2
+                echo "  Resuming in degraded mode; run 'shuttle hooks doctor'." >&2
+                registry_cli degrade "$LAUNCH_ID" "Codex hooks missing, different, or untrusted" || true
+            fi
+            CODEX_COMMAND=(codex resume "$SESSION_ID")
+            [ -z "$PROMPT" ] || CODEX_COMMAND+=("$PROMPT")
+            SUPERVISOR=(env "PYTHONPATH=$SHUTTLE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m shuttlelib.supervisor --launch-id "$LAUNCH_ID" --tmux-session "$TMUX_SESSION" -- "${CODEX_COMMAND[@]}")
+            printf -v RESUME_COMMAND '%q ' "${SUPERVISOR[@]}"
+            tmux new-session -d -s "$TMUX_SESSION" -c "$PROJECT_DIR" "$RESUME_COMMAND"
+        fi
 
-        echo "Resuming session $SESSION_ID"
+        echo "Resuming $AGENT session $SESSION_ID"
         echo "  Project: $PROJECT_DIR"
         echo "  Tmux: $TMUX_SESSION"
-
-        # Launch CC with --resume in new tmux session
-        tmux new-session -d -s "$TMUX_SESSION" -c "$PROJECT_DIR" "claude --resume $SESSION_ID"
-
-        # Wait for claude to start
-        sleep 1
-
-        # Open terminal or print attach instructions
         if [ -n "$HEADLESS" ] || [ -n "$SHUTTLE_HEADLESS" ] || [ -z "$DISPLAY" ]; then
             echo "Attach with: tmux attach -t $TMUX_SESSION"
         else
@@ -1012,6 +1292,8 @@ case "$CMD" in
         ;;
 
     export|x)
+        claude_only_args export "$@"
+        set -- "${CLAUDE_ARGS[@]}"
         # Parse options
         OUTPUT_FORMAT="markdown"
         OUTPUT_FILE=""
@@ -1223,22 +1505,20 @@ $CONTENT
         ;;
 
     peek|p)
-        TARGET="${1:-1}"
-        LINES="${2:-20}"
-
-        if [[ "$TARGET" =~ ^[0-9]+$ ]]; then
-            SESSION=$(tmux ls 2>/dev/null | sed -n "${TARGET}p" | cut -d: -f1)
-        else
-            SESSION=$(tmux ls 2>/dev/null | grep "$TARGET" | head -1 | cut -d: -f1)
-        fi
-
-        if [ -z "$SESSION" ]; then
-            echo "Session not found: $TARGET"
-            exit 1
-        fi
+        AGENT=""
+        POSITIONAL=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --agent) AGENT="$2"; validate_agent "$AGENT"; shift 2 ;;
+                *) POSITIONAL+=("$1"); shift ;;
+            esac
+        done
+        TARGET="${POSITIONAL[0]:-1}"
+        LINES="${POSITIONAL[1]:-20}"
+        SESSION=$(resolve_session "$TARGET" "$AGENT") || exit $?
 
         echo "=== $SESSION (last $LINES lines) ==="
-        tmux capture-pane -t "$SESSION" -p | tail -n "$LINES"
+        tmux capture-pane -t "=$SESSION" -p | tail -n "$LINES"
         ;;
 
     tail|t)
@@ -1309,12 +1589,13 @@ $CONTENT
             if [ "$arg" = "--help" ] || [ "$arg" = "-h" ]; then
                 echo "Usage: shuttle go [options] <brief-id>"
                 echo ""
-                echo "Launch a new Claude Code session on a SKEIN brief."
+                echo "Launch a new Claude or Codex session on a SKEIN brief."
                 echo ""
                 echo "Options:"
                 echo "  -d, --dir PATH      Run in specified directory"
                 echo "  -p, --project NAME  Run in ~/projects/NAME"
                 echo "  --headless          Don't open GUI terminal"
+                echo "  --agent NAME        claude (default) or codex"
                 echo "  -h, --help          Show this help"
                 echo ""
                 echo "Examples:"
@@ -1329,7 +1610,7 @@ $CONTENT
         set -- "${POSITIONAL[@]}"
 
         if [ -z "$1" ]; then
-            echo "Usage: shuttle go [--dir PATH | --project NAME] <brief-id>"
+            echo "Usage: shuttle go [--agent claude|codex] [--dir PATH | --project NAME] <brief-id>"
             exit 1
         fi
         BRIEF_ID="$1"
@@ -1389,8 +1670,12 @@ $CONTENT
             SESSION="shuttle-${BRIEF_TITLE}"
         fi
 
+        if [ "$AGENT" = "codex" ]; then
+            SESSION="shuttle-codex-${SESSION#shuttle-}"
+        fi
+
         # Check if session already exists - reboard instead of creating new
-        if tmux has-session -t "$SESSION" 2>/dev/null; then
+        if tmux has-session -t "=$SESSION" 2>/dev/null; then
             echo "Session '$SESSION' exists - reboarding..."
             if [ -n "$HEADLESS" ]; then
                 echo "Attach with: tmux attach -t $SESSION"
@@ -1400,30 +1685,45 @@ $CONTENT
             exit 0
         fi
 
-        echo "Launching: $SESSION (in $PROJECT_DIR)"
+        echo "Launching: $SESSION [$AGENT] (in $PROJECT_DIR)"
 
-        # Create new tmux session running claude
-        tmux new-session -d -s "$SESSION" -c "$PROJECT_DIR" "claude"
+        PROVIDER_VERSION=$($AGENT --version 2>/dev/null | head -1 | awk '{print $NF}' || true)
+        CREATE_ARGS=(create --provider "$AGENT" --provider-version "${PROVIDER_VERSION:-unknown}" --mode go --cwd "$PROJECT_DIR" --tmux-session "$SESSION" --brief "$BRIEF_ID" --title "${BRIEF_TITLE:-$BRIEF_ID}")
+        LAUNCH_ID=$(registry_cli "${CREATE_ARGS[@]}")
 
-        # Wait for claude prompt to appear (timeout based on config)
-        echo "Waiting for Claude..."
-        MAX_ITERATIONS=$((SHUTTLE_PROMPT_TIMEOUT * 5))  # 5 checks per second
-        for ((i=1; i<=MAX_ITERATIONS; i++)); do
-            CAPTURED=$(tmux capture-pane -t "$SESSION" -p)
-            # Look for Claude's prompt or shortcuts hint
-            if echo "$CAPTURED" | grep -qE "^>|? for"; then
-                echo "Ready!"
-                break
-            fi
-            sleep 0.2
-        done
+        if [ "$AGENT" = "codex" ] && ! registry_cli hooks-doctor --quiet; then
+            echo "Warning: Shuttle's Codex hooks are missing, differ, or are untrusted." >&2
+            echo "  Launching in degraded mode; run 'shuttle hooks doctor' for exact read-only diagnostics." >&2
+            registry_cli degrade "$LAUNCH_ID" "Codex hooks missing, different, or untrusted" || true
+        fi
 
-        # Wait for CC input handler to fully initialize after prompt appears
-        echo "Waiting for input handler..."
-        sleep 4
+        PROVIDER_COMMAND=("$AGENT")
+        if [ "$AGENT" = "codex" ]; then
+            PROVIDER_COMMAND+=("HANDOFF: $BRIEF_ID")
+        fi
+        SUPERVISOR=(env "PYTHONPATH=$SHUTTLE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m shuttlelib.supervisor --launch-id "$LAUNCH_ID" --tmux-session "$SESSION" -- "${PROVIDER_COMMAND[@]}")
+        printf -v SUPERVISOR_COMMAND '%q ' "${SUPERVISOR[@]}"
+        if ! tmux new-session -d -s "$SESSION" -c "$PROJECT_DIR" "$SUPERVISOR_COMMAND"; then
+            registry_cli degrade "$LAUNCH_ID" "tmux failed to create session $SESSION" || true
+            exit 1
+        fi
 
-        # Send the HANDOFF message
-        tmux_send_cmd "$SESSION" "HANDOFF: $BRIEF_ID"
+        if [ "$AGENT" = "claude" ]; then
+            # Preserve the established Claude launch path for this slice.
+            echo "Waiting for Claude..."
+            MAX_ITERATIONS=$((SHUTTLE_PROMPT_TIMEOUT * 5))
+            for ((i=1; i<=MAX_ITERATIONS; i++)); do
+                CAPTURED=$(tmux capture-pane -t "$SESSION" -p)
+                if echo "$CAPTURED" | grep -qE "^>|? for"; then
+                    echo "Ready!"
+                    break
+                fi
+                sleep 0.2
+            done
+            echo "Waiting for input handler..."
+            sleep 4
+            tmux_send_cmd "$SESSION" "HANDOFF: $BRIEF_ID"
+        fi
 
         # Open terminal or print attach instructions
         if [ -n "$HEADLESS" ]; then
@@ -1447,6 +1747,10 @@ $CONTENT
 
         parse_project_opts "$@"
         set -- "${POSITIONAL[@]}"
+        if [ "$AGENT" != "claude" ]; then
+            echo "Error: shuttle $CMD is Claude-only in this release"
+            exit 1
+        fi
 
         if [ -z "$1" ]; then
             echo "Usage: shuttle $CMD [--dir PATH | --project NAME] <brief-id>"
@@ -1563,6 +1867,39 @@ $CONTENT
         echo "Done."
         ;;
 
+    hook)
+        if [ "$1" != "codex" ] || [ -n "$2" ]; then
+            echo "Usage: shuttle hook codex" >&2
+            exit 1
+        fi
+        exec env "PYTHONPATH=$SHUTTLE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m shuttlelib.codex_hook
+        ;;
+
+    hooks|codex-hooks)
+        HOOK_ACTION="${1:-snippet}"
+        case "$HOOK_ACTION" in
+            snippet|show)
+                echo "Exact ~/.codex/hooks.json for Shuttle (not written):"
+                registry_cli hooks-snippet
+                ;;
+            doctor|check)
+                echo "Exact ~/.codex/hooks.json for Shuttle (not written):"
+                registry_cli hooks-snippet
+                echo ""
+                if registry_cli hooks-doctor; then
+                    :
+                else
+                    echo "Hooks are not ready. Codex launches will continue in degraded mode."
+                    exit 1
+                fi
+                ;;
+            *)
+                echo "Usage: shuttle hooks [snippet|doctor]"
+                exit 1
+                ;;
+        esac
+        ;;
+
     config|cfg)
         echo "SHUTTLE CONFIGURATION"
         echo ""
@@ -1579,6 +1916,7 @@ $CONTENT
         echo "Current settings:"
         echo "  SHUTTLE_DEFAULT_PROJECT = ${SHUTTLE_DEFAULT_PROJECT:-(not set, uses pwd)}"
         echo "  SHUTTLE_DEFAULT_SITE    = $SHUTTLE_DEFAULT_SITE"
+        echo "  SHUTTLE_DEFAULT_AGENT   = $SHUTTLE_DEFAULT_AGENT"
         echo "  SHUTTLE_HEADLESS_DEFAULT= ${SHUTTLE_HEADLESS_DEFAULT:-(auto-detect)}"
         echo "  SHUTTLE_PROMPT_TIMEOUT  = ${SHUTTLE_PROMPT_TIMEOUT}s"
         echo "  Terminal                = gnome-terminal (hardcoded; xterm emergency fallback)"
@@ -1586,6 +1924,7 @@ $CONTENT
         echo "Environment overrides (set these to override config):"
         echo "  SHUTTLE_PROJECT  = ${SHUTTLE_PROJECT:-}"
         echo "  SHUTTLE_SITE     = ${SHUTTLE_SITE:-}"
+        echo "  SHUTTLE_DEFAULT_AGENT = ${ENV_SHUTTLE_DEFAULT_AGENT:-}"
         echo "  SHUTTLE_HEADLESS = ${SHUTTLE_HEADLESS:-}"
         echo "  SHUTTLE_TIMEOUT  = ${SHUTTLE_TIMEOUT:-}"
         echo ""
@@ -1598,6 +1937,9 @@ SHUTTLE_DEFAULT_PROJECT=~/projects/main
 
 # Default SKEIN site for briefs
 SHUTTLE_DEFAULT_SITE=ledger
+
+# Default provider: claude or codex
+SHUTTLE_DEFAULT_AGENT=claude
 
 # Always run headless (set to 1, or leave empty for auto-detect)
 SHUTTLE_HEADLESS_DEFAULT=
@@ -1630,6 +1972,13 @@ EXAMPLE
             echo "  GNOME_TERMINAL_SERVICE = $GNOME_TERMINAL_SERVICE"
         else
             echo "  GNOME_TERMINAL_SERVICE = (unset — clean)"
+        fi
+        echo ""
+
+        if registry_cli hooks-doctor; then
+            :
+        else
+            echo "  Codex launches remain available in degraded mode."
         fi
         echo ""
 
@@ -1697,6 +2046,8 @@ EXAMPLE
         ;;
 
     index|i)
+        claude_only_args index "$@"
+        set -- "${CLAUDE_ARGS[@]}"
         # Index all CC sessions for fast search
         SHUTTLE_INDEX_DIR="$HOME/.shuttle"
         SHUTTLE_INDEX_FILE="$SHUTTLE_INDEX_DIR/index.json"
@@ -1970,7 +2321,7 @@ EXAMPLE
 
     help|--help|-h)
         cat << 'EOF'
-shuttle - Manage Claude Code agent sessions
+shuttle - Manage Claude and Codex agent sessions
 
 Commands:
   status          Show sessions, briefs, and shards (default)
@@ -1998,6 +2349,8 @@ Commands:
   ground          Kill all shuttle sessions
   config, cfg     Show current configuration
   doctor, dr      Diagnose gnome-terminal launch environment
+  hooks [action]  Print or diagnose the read-only Codex hook configuration
+  hook codex      Codex hook stdin entry point (for hooks.json)
 
 Index options:
   --update, -u    Incremental update (only changed files)
@@ -2020,7 +2373,8 @@ Targeting sessions:
   <number>  Positional index from 'shuttle' output (e.g., 1, 2, 3)
             WARNING: These shift when sessions exit. Not safe for automation.
 
-  <name>    Session name (e.g., cc-speakbot-997451, shuttle-my-task)
+  <name>    Exact name, or a partial name that matches exactly one session
+            (e.g., cc-speakbot-997451, shuttle-codex-my-task)
             Stable identifier that doesn't change. Recommended for watchman/automation.
 
   Race condition example:
@@ -2038,6 +2392,7 @@ Options (for go, board, split, vsplit):
   -d, --dir PATH      Run in specified directory (go, split, vsplit)
   -p, --project NAME  Run in ~/projects/NAME (go, split, vsplit)
   --headless          Don't open GUI terminal (go, board)
+  --agent NAME        Select claude or codex (bare go defaults to claude)
   (default: current directory or SHUTTLE_DEFAULT_PROJECT, auto-headless if no $DISPLAY)
 
 Configuration:
@@ -2047,6 +2402,7 @@ Configuration:
   Environment variables (override config file):
     SHUTTLE_PROJECT   Default project directory
     SHUTTLE_SITE      Default SKEIN site for briefs
+    SHUTTLE_DEFAULT_AGENT  Default provider: claude or codex
     SHUTTLE_HEADLESS  Force headless mode (1 = always headless)
     SHUTTLE_TIMEOUT   Prompt detection timeout in seconds
     SHUTTLE_SKIP_WINDOW_CHECK  Skip post-launch window verification (set to 1)
@@ -2073,6 +2429,8 @@ Examples:
   shuttle search "auth" -a    # search content across all projects
   shuttle search -l -s 7      # list sessions from last 7 days
   shuttle go brief-20251210-ceor
+  shuttle go --agent codex brief-20251210-ceor
+  shuttle hooks doctor       # print/check hooks; never edits dotfiles
   shuttle go -p skein brief-20251210-ceor  # launch in skein project
   shuttle go --headless brief-id  # create session without opening terminal
   shuttle split brief-20251210-ceor  # side-by-side pairing

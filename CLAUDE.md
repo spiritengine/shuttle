@@ -1,6 +1,6 @@
 # Shuttle
 
-CLI for launching and managing Claude Code pairing sessions.
+CLI for launching and managing Claude Code and Codex pairing sessions.
 
 ## Starting a new session on this repo (for agents)
 
@@ -59,6 +59,7 @@ full required-reading dance if the task is small.
 shuttle              # status with state indicators (⏳🧠🔒💤⚠️)
 shuttle watch        # continuous status refresh (Ctrl-C to exit)
 shuttle go <brief>   # launch session on brief (new window)
+shuttle go --agent codex <brief>  # Codex session; Claude is the default
 shuttle split <brief>   # open brief in horizontal split pane
 shuttle vsplit <brief>  # open brief in vertical split pane
 shuttle unsplit         # close split pane
@@ -169,6 +170,9 @@ SHUTTLE_DEFAULT_PROJECT=~/projects/main
 # Default SKEIN site for briefs
 SHUTTLE_DEFAULT_SITE=ledger
 
+# Default provider (claude or codex)
+SHUTTLE_DEFAULT_AGENT=claude
+
 # Always run headless (set to 1, or leave empty for auto-detect)
 SHUTTLE_HEADLESS_DEFAULT=
 
@@ -210,7 +214,7 @@ shuttle search -l -p speakbot      # list sessions for speakbot project
 
 ## Architecture
 
-- Single bash script at `bin/shuttle`
+- Bash CLI at `bin/shuttle` plus `shuttlelib` registry/hook/supervisor helpers
 - Uses tmux for session management
 - Launches windows via gnome-terminal (with xterm emergency fallback for
   dbus-stale errors — see `shuttle doctor`)

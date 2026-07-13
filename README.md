@@ -1,6 +1,6 @@
 # Shuttle
 
-CLI for managing Claude Code agent sessions. Launch, board, and manage CC sessions from the command line.
+CLI for managing Claude Code and Codex sessions. Launch, board, and manage both providers from the command line.
 
 ## Install
 
@@ -13,6 +13,7 @@ ln -sf ~/projects/shuttle/bin/shuttle ~/bin/shuttle
 ```bash
 shuttle                  # show status (sessions, briefs, shards)
 shuttle go <brief-id>    # launch new session on a brief
+shuttle go --agent codex <brief-id>  # launch Codex (Claude remains default)
 shuttle board <n>        # board session by number or name
 shuttle ls               # list active sessions
 shuttle kill <n>         # kill session by number or name
@@ -28,7 +29,7 @@ shuttle go brief-20251210-ceor
 # Board the first session
 shuttle board 1
 
-# Board by partial name match
+# Board by an unambiguous partial name match
 shuttle board diverge
 
 # Kill session #2
@@ -40,10 +41,17 @@ shuttle ground
 
 ## How it works
 
-- Creates tmux sessions with Claude Code
-- Auto-sends `HANDOFF: <brief-id>` to ignite on the brief
+- Creates supervised tmux sessions with provider-neutral registry records
+- Sends Claude `HANDOFF: <brief-id>` after readiness; passes it to Codex as the initial prompt
 - Names sessions based on brief titles for easy identification
-- Reboards existing sessions instead of creating duplicates
+- Uses `shuttle-<title>` for Claude and `shuttle-codex-<title>` for Codex
+- Reboards existing same-provider sessions instead of creating duplicates
+- Uses structured Codex hook state for status and safe send decisions
+
+Codex hooks are never installed automatically. `shuttle hooks` prints the exact
+`~/.codex/hooks.json` document, and `shuttle hooks doctor` diagnoses the file and
+Codex trust records without writing either one. Codex still launches with a clear
+degraded warning when hooks are absent or untrusted.
 
 ## Parser
 

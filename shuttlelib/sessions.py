@@ -452,6 +452,47 @@ class Registry:
 
         return self._mutate(launch_id, bind)
 
+    def bind_location(
+        self,
+        launch_id: str,
+        *,
+        tmux_session: str,
+        pane_id: str,
+        pid: int,
+    ) -> dict[str, Any]:
+        """Bind the exact live tmux/process location for a supervised launch.
+
+        Location is launcher-owned rather than provider-owned.  Repeating the
+        same binding is harmless, but changing any non-null value would make
+        targeting unsafe and is therefore rejected.
+        """
+
+        if not isinstance(tmux_session, str) or not tmux_session:
+            raise InvalidRecord("tmux_session must be a non-empty string")
+        if not isinstance(pane_id, str) or not pane_id:
+            raise InvalidRecord("pane_id must be a non-empty string")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise InvalidRecord("pid must be a positive integer")
+
+        def bind(record: dict[str, Any]) -> None:
+            requested = {
+                "tmux_session": tmux_session,
+                "pane_id": pane_id,
+                "pid": pid,
+            }
+            for field, value in requested.items():
+                current = record[field]
+                if current is not None and current != value:
+                    raise BindingConflict(
+                        f"launch {launch_id} {field} is {current!r}, not {value!r}"
+                    )
+            changed = any(record[field] is None for field in requested)
+            if changed:
+                record.update(requested)
+                record["updated_at"] = self._clock()
+
+        return self._mutate(launch_id, bind)
+
     def transition(self, launch_id: str, state: str) -> dict[str, Any]:
         if state not in LIVE_STATES:
             if state == "closed":
