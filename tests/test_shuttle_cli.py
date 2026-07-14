@@ -914,6 +914,44 @@ def test_hooks_install_preserves_valid_existing_hook_shapes(cli_env) -> None:
         assert hook_coords(installed, event) == [(0, 0)]
 
 
+@pytest.mark.parametrize("async_value", [True, False])
+def test_hooks_install_preserves_valid_async_values(
+    cli_env, async_value: bool
+) -> None:
+    env, _ = cli_env
+    codex_dir = Path(env["HOME"]) / ".codex"
+    codex_dir.mkdir()
+    hooks = codex_dir / "hooks.json"
+    config = codex_dir / "config.toml"
+    existing_hook = {
+        "type": "command",
+        "command": "echo keep",
+        "async": async_value,
+    }
+    existing = {"hooks": {"SessionStart": [{"hooks": [existing_hook]}]}}
+    write_json(hooks, existing)
+    hooks.chmod(0o640)
+    original_bytes = hooks.read_bytes()
+    config.write_text("sentinel = true\n", encoding="utf-8")
+
+    result = run_cli(env, "hooks", "install")
+
+    assert result.returncode == 0, result.stderr.decode()
+    installed = json.loads(hooks.read_text(encoding="utf-8"))
+    assert installed["hooks"]["SessionStart"][0]["hooks"] == [
+        existing_hook,
+        HOOK_COMMAND,
+    ]
+    for event in ("UserPromptSubmit", "PermissionRequest", "Stop"):
+        assert hook_coords(installed, event) == [(0, 0)]
+    assert S_IMODE(hooks.stat().st_mode) == 0o640
+    assert config.read_text(encoding="utf-8") == "sentinel = true\n"
+    backups = list(codex_dir.glob("hooks.json.shuttle.*.bak"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == original_bytes
+    assert not list(codex_dir.glob(".hooks.json.*.tmp"))
+
+
 @pytest.mark.parametrize(
     "description",
     [
@@ -1249,6 +1287,59 @@ def test_hooks_install_refuses_invalid_top_level_values_before_backup(
     assert result.stderr.startswith(b"shuttle hooks:")
     assert needle in result.stderr
     assert b"Traceback" not in result.stderr
+    assert hooks.read_bytes() == body
+    assert S_IMODE(hooks.stat().st_mode) == 0o640
+    assert config.read_text(encoding="utf-8") == "sentinel = true\n"
+    assert not list(codex_dir.glob("hooks.json.shuttle.*.bak"))
+    assert not list(codex_dir.glob(".hooks.json.*.tmp"))
+
+
+@pytest.mark.parametrize(
+    "async_value",
+    [
+        None,
+        0,
+        1,
+        "false",
+        [],
+        {"enabled": True},
+    ],
+)
+def test_hooks_install_refuses_invalid_async_values_before_backup(
+    cli_env, async_value: object
+) -> None:
+    env, _ = cli_env
+    codex_dir = Path(env["HOME"]) / ".codex"
+    codex_dir.mkdir()
+    hooks = codex_dir / "hooks.json"
+    config = codex_dir / "config.toml"
+    document = {
+        "hooks": {
+            "SessionStart": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "echo keep",
+                            "async": async_value,
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+    body = (json.dumps(document, separators=(",", ":")) + "\n").encode()
+    hooks.write_bytes(body)
+    hooks.chmod(0o640)
+    config.write_text("sentinel = true\n", encoding="utf-8")
+
+    result = run_cli(env, "hooks", "install")
+
+    assert result.returncode == 1
+    assert result.stderr == (
+        b"shuttle hooks: "
+        b"hooks.SessionStart[0].hooks[0].async must be a boolean\n"
+    )
     assert hooks.read_bytes() == body
     assert S_IMODE(hooks.stat().st_mode) == 0o640
     assert config.read_text(encoding="utf-8") == "sentinel = true\n"

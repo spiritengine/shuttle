@@ -136,8 +136,8 @@ def _is_optional_string(value: Any) -> bool:
     return value is None or isinstance(value, str)
 
 
-def _is_optional_bool(value: Any) -> bool:
-    return value is None or isinstance(value, bool)
+def _is_bool(value: Any) -> bool:
+    return isinstance(value, bool)
 
 
 def _hook_shape_errors(document: Any, *, require_hooks: bool) -> list[str]:
@@ -220,7 +220,7 @@ def _hook_shape_errors(document: Any, *, require_hooks: bool) -> list[str]:
                     hook["command_windows"]
                 ):
                     errors.append(f"{hook_path}.command_windows must be a string")
-                if "async" in hook and not _is_optional_bool(hook["async"]):
+                if "async" in hook and not _is_bool(hook["async"]):
                     errors.append(f"{hook_path}.async must be a boolean")
     return errors
 
