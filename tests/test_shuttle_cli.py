@@ -239,6 +239,19 @@ for line in sys.stdin:
                     }
                 ]
             }
+        elif mode == "hook_warnings":
+            result = {
+                "data": [
+                    {
+                        "cwd": cwd,
+                        "hooks": [],
+                        "warnings": [
+                            "/tmp/broken-hooks.json: missing field `command`"
+                        ],
+                        "errors": [],
+                    }
+                ]
+            }
         else:
             result = {"data": [hook_metadata(cwd)]}
         emit({"id": request["id"], "result": result})
@@ -679,6 +692,52 @@ def test_hooks_install_additively_merges_and_preserves_existing_hooks(
     assert config.read_text(encoding="utf-8") == "sentinel = true\n"
 
 
+def test_hooks_install_preserves_valid_existing_hook_shapes(cli_env) -> None:
+    env, _ = cli_env
+    codex_dir = Path(env["HOME"]) / ".codex"
+    codex_dir.mkdir()
+    hooks = codex_dir / "hooks.json"
+    prompt_hook = {
+        "type": "prompt",
+        "prompt": "parsed by Codex, skipped by Shuttle",
+        "futureField": {"preserve": True},
+    }
+    agent_hook = {
+        "type": "agent",
+        "agent": "worker",
+        "futureField": ["preserve"],
+    }
+    command_hook = {
+        "type": "command",
+        "command": "echo keep",
+        "timeout": 0,
+        "statusMessage": "Keeping hook",
+        "commandWindows": "cmd /c echo keep",
+        "async": False,
+        "futureField": 42,
+    }
+    existing = {
+        "hooks": {
+            "OtherEvent": [
+                {
+                    "matcher": "*",
+                    "hooks": [prompt_hook, agent_hook, command_hook],
+                    "groupFutureField": "preserve",
+                }
+            ]
+        }
+    }
+    write_json(hooks, existing)
+
+    result = run_cli(env, "hooks", "install")
+
+    assert result.returncode == 0, result.stderr.decode()
+    installed = json.loads(hooks.read_text(encoding="utf-8"))
+    assert installed["hooks"]["OtherEvent"] == existing["hooks"]["OtherEvent"]
+    for event in HOOK_EVENTS:
+        assert hook_coords(installed, event) == [(0, 0)]
+
+
 def test_hooks_doctor_uses_app_server_trust_not_config_toml(cli_env) -> None:
     env, _ = cli_env
     install_fake_codex_app_server(env)
@@ -776,6 +835,28 @@ def test_hooks_doctor_reports_app_server_error_and_timeout(
     assert needle in result.stdout
 
 
+def test_hooks_doctor_reports_app_server_hook_warnings(cli_env) -> None:
+    env, _ = cli_env
+    install_fake_codex_app_server(env)
+    env["FAKE_CODEX_APP_SERVER_MODE"] = "hook_warnings"
+    codex_dir = Path(env["HOME"]) / ".codex"
+    codex_dir.mkdir()
+    hooks = codex_dir / "hooks.json"
+    write_json(
+        hooks, {"hooks": {event: [{"hooks": [HOOK_COMMAND]}] for event in HOOK_EVENTS}}
+    )
+
+    result = run_cli(env, "hooks", "doctor")
+
+    assert result.returncode == 1
+    assert b"trust unverified: Codex hooks/list returned hook warnings" in result.stdout
+    assert (
+        b"hook warning: /tmp/broken-hooks.json: missing field `command`"
+        in result.stdout
+    )
+    assert b"Codex did not report Shuttle hook" not in result.stdout
+
+
 def test_hooks_doctor_requires_codex_enabled_status(cli_env) -> None:
     env, _ = cli_env
     install_fake_codex_app_server(env)
@@ -852,6 +933,73 @@ def test_hooks_install_refuses_malformed_unknown_event_before_backup(cli_env) ->
 
     assert result.returncode == 1
     assert b"hooks.UnknownEvent[0].hooks[0] must be an object" in result.stderr
+    assert hooks.read_bytes() == body
+    assert config.read_text(encoding="utf-8") == "sentinel = true\n"
+    assert not list(codex_dir.glob("hooks.json.shuttle.*.bak"))
+    assert not list(codex_dir.glob(".hooks.json.*.tmp"))
+
+
+@pytest.mark.parametrize(
+    ("document", "needle"),
+    [
+        (
+            {"hooks": {"UnknownEvent": [{"hooks": [{"command": "echo no type"}]}]}},
+            b"hooks.UnknownEvent[0].hooks[0].type is required",
+        ),
+        (
+            {"hooks": {"SessionStart": [{"hooks": [{"type": "command"}]}]}},
+            b"hooks.SessionStart[0].hooks[0].command is required for command hooks",
+        ),
+        (
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {"hooks": [{"type": "command", "command": 5}]}
+                    ]
+                }
+            },
+            b"hooks.SessionStart[0].hooks[0].command must be a string",
+        ),
+        (
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "echo keep",
+                                    "timeout": True,
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+            b"hooks.SessionStart[0].hooks[0].timeout must be a non-negative integer",
+        ),
+        (
+            {"hooks": {"SessionStart": [{"matcher": 5, "hooks": []}]}},
+            b"hooks.SessionStart[0].matcher must be a string",
+        ),
+    ],
+)
+def test_hooks_install_refuses_malformed_hook_objects_before_backup(
+    cli_env, document: dict, needle: bytes
+) -> None:
+    env, _ = cli_env
+    codex_dir = Path(env["HOME"]) / ".codex"
+    codex_dir.mkdir()
+    hooks = codex_dir / "hooks.json"
+    config = codex_dir / "config.toml"
+    body = (json.dumps(document, separators=(",", ":")) + "\n").encode()
+    hooks.write_bytes(body)
+    config.write_text("sentinel = true\n", encoding="utf-8")
+
+    result = run_cli(env, "hooks", "install")
+
+    assert result.returncode == 1
+    assert needle in result.stderr
     assert hooks.read_bytes() == body
     assert config.read_text(encoding="utf-8") == "sentinel = true\n"
     assert not list(codex_dir.glob("hooks.json.shuttle.*.bak"))

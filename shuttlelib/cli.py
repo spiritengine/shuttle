@@ -37,6 +37,7 @@ HOOK_COMMAND = {
     "command": "shuttle hook codex",
     "timeout": 12,
 }
+HOOK_HANDLER_TYPES = ("command", "prompt", "agent")
 
 
 class HookConfigError(ValueError):
@@ -98,6 +99,18 @@ def _is_unconditional_group(group: dict[str, Any]) -> bool:
     return group.get("matcher") in (None, "")
 
 
+def _is_non_negative_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_optional_string(value: Any) -> bool:
+    return value is None or isinstance(value, str)
+
+
+def _is_optional_bool(value: Any) -> bool:
+    return value is None or isinstance(value, bool)
+
+
 def _hook_shape_errors(document: Any, *, require_hooks: bool) -> list[str]:
     if not isinstance(document, dict):
         return ["hooks.json must contain a JSON object"]
@@ -120,15 +133,55 @@ def _hook_shape_errors(document: Any, *, require_hooks: bool) -> list[str]:
             if not isinstance(group, dict):
                 errors.append(f"{group_path} must be an object")
                 continue
+            matcher = group.get("matcher")
+            if matcher is not None and not isinstance(matcher, str):
+                errors.append(f"{group_path}.matcher must be a string")
             group_hooks = group.get("hooks")
             if not isinstance(group_hooks, list):
                 errors.append(f"{group_path}.hooks must be a list")
                 continue
             for hook_index, hook in enumerate(group_hooks):
+                hook_path = f"{group_path}.hooks[{hook_index}]"
                 if not isinstance(hook, dict):
-                    errors.append(
-                        f"{group_path}.hooks[{hook_index}] must be an object"
-                    )
+                    errors.append(f"{hook_path} must be an object")
+                    continue
+                if "type" not in hook:
+                    errors.append(f"{hook_path}.type is required")
+                    continue
+                hook_type = hook["type"]
+                if not isinstance(hook_type, str):
+                    errors.append(f"{hook_path}.type must be a string")
+                    continue
+                if hook_type not in HOOK_HANDLER_TYPES:
+                    expected = ", ".join(HOOK_HANDLER_TYPES)
+                    errors.append(f"{hook_path}.type must be one of: {expected}")
+                    continue
+                if hook_type != "command":
+                    continue
+                if "command" not in hook:
+                    errors.append(f"{hook_path}.command is required for command hooks")
+                elif not isinstance(hook["command"], str):
+                    errors.append(f"{hook_path}.command must be a string")
+                if (
+                    "timeout" in hook
+                    and hook["timeout"] is not None
+                    and not _is_non_negative_int(hook["timeout"])
+                ):
+                    errors.append(f"{hook_path}.timeout must be a non-negative integer")
+                if "statusMessage" in hook and not _is_optional_string(
+                    hook["statusMessage"]
+                ):
+                    errors.append(f"{hook_path}.statusMessage must be a string")
+                if "commandWindows" in hook and not _is_optional_string(
+                    hook["commandWindows"]
+                ):
+                    errors.append(f"{hook_path}.commandWindows must be a string")
+                if "command_windows" in hook and not _is_optional_string(
+                    hook["command_windows"]
+                ):
+                    errors.append(f"{hook_path}.command_windows must be a string")
+                if "async" in hook and not _is_optional_bool(hook["async"]):
+                    errors.append(f"{hook_path}.async must be a boolean")
     return errors
 
 
@@ -641,6 +694,37 @@ def _find_codex_hook_metadata(
     return None
 
 
+def _format_hook_issue(label: str, item: Any) -> str:
+    if isinstance(item, str):
+        return f"hook {label}: {item}"
+    if isinstance(item, dict):
+        message = item.get("message")
+        path = item.get("path")
+        if isinstance(message, str) and isinstance(path, str):
+            return f"hook {label}: {path}: {message}"
+        if isinstance(message, str):
+            return f"hook {label}: {message}"
+        if isinstance(path, str):
+            return f"hook {label}: {path}"
+    return f"hook {label}: {item!r}"
+
+
+def _append_hooks_list_issues(
+    messages: list[str], entry: dict[str, Any], field: str, label: str
+) -> bool:
+    items = entry.get(field)
+    if not items:
+        return False
+    if not isinstance(items, list):
+        messages.append(
+            f"trust unverified: Codex hooks/list returned malformed {field}"
+        )
+        return True
+    messages.append(f"trust unverified: Codex hooks/list returned hook {field}")
+    messages.extend(_format_hook_issue(label, item) for item in items)
+    return True
+
+
 def hooks_diagnostics(
     home: Path | None = None,
     *,
@@ -684,17 +768,9 @@ def hooks_diagnostics(
     if entry_error is not None or entry is None:
         messages.append(f"trust unverified: {entry_error}")
         return False, messages
-    entry_errors = entry.get("errors")
-    if entry_errors:
-        messages.append("trust unverified: Codex hooks/list returned hook errors")
-        for item in entry_errors:
-            if isinstance(item, dict):
-                message = item.get("message")
-                path = item.get("path")
-                if message and path:
-                    messages.append(f"hook error: {path}: {message}")
-                elif message:
-                    messages.append(f"hook error: {message}")
+    if _append_hooks_list_issues(messages, entry, "errors", "error"):
+        return False, messages
+    if _append_hooks_list_issues(messages, entry, "warnings", "warning"):
         return False, messages
     codex_hooks = entry.get("hooks")
     if not isinstance(codex_hooks, list):
