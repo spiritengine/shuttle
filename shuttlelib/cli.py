@@ -83,6 +83,13 @@ class CodexHookPaths:
     hooks_path: Path
 
 
+def _normalize_codex_home_from_env(value: str) -> Path:
+    expanded = Path(value).expanduser()
+    if not expanded.is_absolute():
+        expanded = Path.cwd() / expanded
+    return expanded.resolve(strict=False)
+
+
 def hook_document() -> dict[str, Any]:
     return {
         "hooks": {
@@ -95,7 +102,7 @@ def hook_document() -> dict[str, Any]:
 def _resolve_codex_hook_paths(home: Path | None = None) -> CodexHookPaths:
     user_home = Path.home() if home is None else home
     if home is None and os.environ.get("CODEX_HOME"):
-        codex_home = Path(os.environ["CODEX_HOME"]).expanduser()
+        codex_home = _normalize_codex_home_from_env(os.environ["CODEX_HOME"])
     else:
         codex_home = user_home / ".codex"
     return CodexHookPaths(
@@ -143,11 +150,15 @@ def _hook_shape_errors(document: Any, *, require_hooks: bool) -> list[str]:
                 f"top-level key {key!r} is not supported; "
                 f"allowed keys: {allowed_keys}"
             ]
-    hooks = document.get("hooks")
-    if hooks is None:
+    if "description" in document and not _is_optional_string(
+        document["description"]
+    ):
+        return ["top-level 'description' must be a string or null"]
+    if "hooks" not in document:
         if require_hooks:
             return ["top-level 'hooks' must be an object"]
         return []
+    hooks = document["hooks"]
     if not isinstance(hooks, dict):
         return ["top-level 'hooks' must be an object"]
 

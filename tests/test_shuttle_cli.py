@@ -96,6 +96,7 @@ def run_cli(
     *args: str,
     input_bytes: bytes | None = None,
     timeout: float | None = None,
+    cwd: Path | None = None,
 ):
     return subprocess.run(
         [str(SHUTTLE), *args],
@@ -104,6 +105,7 @@ def run_cli(
         stderr=subprocess.PIPE,
         env=env,
         timeout=timeout,
+        cwd=cwd,
         check=False,
     )
 
@@ -166,7 +168,10 @@ def emit(message):
 
 
 def hook_metadata(cwd):
-    codex_home = Path(os.environ["CODEX_HOME"])
+    codex_home = Path(os.environ["CODEX_HOME"]).expanduser()
+    if not codex_home.is_absolute():
+        codex_home = Path.cwd() / codex_home
+    codex_home = codex_home.resolve(strict=False)
     log_path = os.environ.get("FAKE_CODEX_HOME_LOG")
     if log_path:
         with open(log_path, "a", encoding="utf-8") as stream:
@@ -677,6 +682,41 @@ def test_hooks_install_and_doctor_default_codex_home_without_env(
     assert probe_log.read_text(encoding="utf-8").splitlines() == [str(codex_home)]
 
 
+def test_hooks_install_and_doctor_resolve_relative_codex_home_against_subprocess_cwd(
+    cli_env, tmp_path: Path
+) -> None:
+    env, _ = cli_env
+    install_fake_codex_app_server(env)
+    cwd = tmp_path / "subprocess-cwd"
+    cwd.mkdir()
+    env["CODEX_HOME"] = "relative-codex-home"
+    expected_codex_home = cwd / "relative-codex-home"
+    hooks = expected_codex_home / "hooks.json"
+    config = expected_codex_home / "config.toml"
+    default_codex_dir = Path(env["HOME"]) / ".codex"
+    probe_log = tmp_path / "codex-home.log"
+    env["FAKE_CODEX_HOME_LOG"] = str(probe_log)
+
+    installed = run_cli(env, "hooks", "install", cwd=cwd)
+
+    assert installed.returncode == 0, installed.stderr.decode()
+    assert f"updated: {hooks}".encode() in installed.stdout
+    assert hooks.exists()
+    assert not default_codex_dir.exists()
+    assert not config.exists()
+
+    doctor = run_cli(env, "hooks", "doctor", cwd=cwd)
+
+    assert doctor.returncode == 0, doctor.stderr.decode()
+    assert f"configured: {hooks}".encode() in doctor.stdout
+    assert b"all Shuttle Codex hooks are trusted and enabled" in doctor.stdout
+    assert probe_log.read_text(encoding="utf-8").splitlines() == [
+        str(expected_codex_home)
+    ]
+    assert not default_codex_dir.exists()
+    assert not config.exists()
+
+
 def test_hooks_explicit_home_ignores_codex_home_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -874,6 +914,32 @@ def test_hooks_install_preserves_valid_existing_hook_shapes(cli_env) -> None:
         assert hook_coords(installed, event) == [(0, 0)]
 
 
+@pytest.mark.parametrize(
+    "description",
+    [
+        "  Existing Codex hook description stays exact.  ",
+        None,
+    ],
+)
+def test_hooks_install_preserves_valid_description_values(
+    cli_env, description: str | None
+) -> None:
+    env, _ = cli_env
+    codex_dir = Path(env["HOME"]) / ".codex"
+    codex_dir.mkdir()
+    hooks = codex_dir / "hooks.json"
+    existing = {"description": description, "hooks": {}}
+    write_json(hooks, existing)
+
+    result = run_cli(env, "hooks", "install")
+
+    assert result.returncode == 0, result.stderr.decode()
+    installed = json.loads(hooks.read_text(encoding="utf-8"))
+    assert installed["description"] == description
+    for event in HOOK_EVENTS:
+        assert hook_coords(installed, event) == [(0, 0)]
+
+
 def test_hooks_doctor_uses_app_server_trust_not_config_toml(cli_env) -> None:
     env, _ = cli_env
     install_fake_codex_app_server(env)
@@ -1049,6 +1115,23 @@ def test_hooks_doctor_rejects_malformed_unknown_event(cli_env) -> None:
     assert b"hooks.UnknownEvent[0].hooks[0] must be an object" in result.stdout
 
 
+def test_hooks_doctor_rejects_explicit_null_hooks(cli_env) -> None:
+    env, _ = cli_env
+    codex_dir = Path(env["HOME"]) / ".codex"
+    codex_dir.mkdir()
+    hooks = codex_dir / "hooks.json"
+    body = b'{"hooks":null}\n'
+    hooks.write_bytes(body)
+
+    result = run_cli(env, "hooks", "doctor")
+
+    assert result.returncode == 1
+    assert b"top-level 'hooks' must be an object" in result.stdout
+    assert hooks.read_bytes() == body
+    assert not list(codex_dir.glob("hooks.json.shuttle.*.bak"))
+    assert not list(codex_dir.glob(".hooks.json.*.tmp"))
+
+
 @pytest.mark.parametrize(
     ("name", "body"),
     [
@@ -1118,6 +1201,54 @@ def test_hooks_install_refuses_unknown_top_level_key_before_backup(cli_env) -> N
     assert result.returncode == 1
     assert b"top-level key 'metadata' is not supported" in result.stderr
     assert b"allowed keys: description, hooks" in result.stderr
+    assert hooks.read_bytes() == body
+    assert S_IMODE(hooks.stat().st_mode) == 0o640
+    assert config.read_text(encoding="utf-8") == "sentinel = true\n"
+    assert not list(codex_dir.glob("hooks.json.shuttle.*.bak"))
+    assert not list(codex_dir.glob(".hooks.json.*.tmp"))
+
+
+@pytest.mark.parametrize(
+    ("document", "needle"),
+    [
+        ({"hooks": None}, b"top-level 'hooks' must be an object"),
+        (
+            {"description": 7, "hooks": {}},
+            b"top-level 'description' must be a string or null",
+        ),
+        (
+            {"description": True, "hooks": {}},
+            b"top-level 'description' must be a string or null",
+        ),
+        (
+            {"description": ["no"], "hooks": {}},
+            b"top-level 'description' must be a string or null",
+        ),
+        (
+            {"description": {"no": True}, "hooks": {}},
+            b"top-level 'description' must be a string or null",
+        ),
+    ],
+)
+def test_hooks_install_refuses_invalid_top_level_values_before_backup(
+    cli_env, document: dict, needle: bytes
+) -> None:
+    env, _ = cli_env
+    codex_dir = Path(env["HOME"]) / ".codex"
+    codex_dir.mkdir()
+    hooks = codex_dir / "hooks.json"
+    config = codex_dir / "config.toml"
+    body = (json.dumps(document, separators=(",", ":")) + "\n").encode()
+    hooks.write_bytes(body)
+    hooks.chmod(0o640)
+    config.write_text("sentinel = true\n", encoding="utf-8")
+
+    result = run_cli(env, "hooks", "install")
+
+    assert result.returncode == 1
+    assert result.stderr.startswith(b"shuttle hooks:")
+    assert needle in result.stderr
+    assert b"Traceback" not in result.stderr
     assert hooks.read_bytes() == body
     assert S_IMODE(hooks.stat().st_mode) == 0o640
     assert config.read_text(encoding="utf-8") == "sentinel = true\n"
