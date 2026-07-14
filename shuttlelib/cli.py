@@ -74,6 +74,13 @@ class HookTrustProbeResult:
 TrustProbe = Callable[[Path, Path], HookTrustProbeResult]
 
 
+@dataclass(frozen=True)
+class CodexHookPaths:
+    user_home: Path
+    codex_home: Path
+    hooks_path: Path
+
+
 def hook_document() -> dict[str, Any]:
     return {
         "hooks": {
@@ -81,6 +88,19 @@ def hook_document() -> dict[str, Any]:
             for event in HOOK_EVENTS
         }
     }
+
+
+def _resolve_codex_hook_paths(home: Path | None = None) -> CodexHookPaths:
+    user_home = Path.home() if home is None else home
+    if home is None and os.environ.get("CODEX_HOME"):
+        codex_home = Path(os.environ["CODEX_HOME"]).expanduser()
+    else:
+        codex_home = user_home / ".codex"
+    return CodexHookPaths(
+        user_home=user_home,
+        codex_home=codex_home,
+        hooks_path=codex_home / "hooks.json",
+    )
 
 
 def _is_shuttle_command_hook(hook: Any) -> bool:
@@ -444,8 +464,7 @@ def _install_hooks_locked(hooks_path: Path) -> HookInstallResult:
 
 
 def install_hooks(home: Path | None = None) -> HookInstallResult:
-    home = Path.home() if home is None else home
-    hooks_path = home / ".codex" / "hooks.json"
+    hooks_path = _resolve_codex_hook_paths(home).hooks_path
     try:
         with _install_lock(hooks_path.parent):
             return _install_hooks_locked(hooks_path)
@@ -585,7 +604,11 @@ def _read_app_server_response(
 
 
 def codex_app_server_trust_probe(
-    home: Path, cwd: Path, *, timeout_sec: float | None = None
+    home: Path,
+    cwd: Path,
+    *,
+    codex_home: Path | None = None,
+    timeout_sec: float | None = None,
 ) -> HookTrustProbeResult:
     if timeout_sec is None:
         try:
@@ -594,9 +617,11 @@ def codex_app_server_trust_probe(
             )
         except ValueError:
             timeout_sec = 3.0
+    if codex_home is None:
+        codex_home = home / ".codex"
     env = os.environ.copy()
     env["HOME"] = str(home)
-    env["CODEX_HOME"] = str(home / ".codex")
+    env["CODEX_HOME"] = str(codex_home)
     deadline = time.monotonic() + timeout_sec
     process: subprocess.Popen[str] | None = None
     try:
@@ -731,8 +756,8 @@ def hooks_diagnostics(
     trust_probe: TrustProbe = codex_app_server_trust_probe,
     cwd: Path | None = None,
 ) -> tuple[bool, list[str]]:
-    home = Path.home() if home is None else home
-    hooks_path = home / ".codex" / "hooks.json"
+    paths = _resolve_codex_hook_paths(home)
+    hooks_path = paths.hooks_path
     cwd = Path.cwd() if cwd is None else cwd
     messages: list[str] = []
     try:
@@ -758,7 +783,12 @@ def hooks_diagnostics(
         messages.extend(errors)
         return False, messages
 
-    probe = trust_probe(home, cwd)
+    if trust_probe is codex_app_server_trust_probe:
+        probe = codex_app_server_trust_probe(
+            paths.user_home, cwd, codex_home=paths.codex_home
+        )
+    else:
+        probe = trust_probe(paths.user_home, cwd)
     if probe.error is not None or probe.data is None:
         detail = probe.error or "Codex hooks/list returned no data"
         messages.append(f"trust unverified: {detail}")
@@ -768,9 +798,12 @@ def hooks_diagnostics(
     if entry_error is not None or entry is None:
         messages.append(f"trust unverified: {entry_error}")
         return False, messages
-    if _append_hooks_list_issues(messages, entry, "errors", "error"):
-        return False, messages
-    if _append_hooks_list_issues(messages, entry, "warnings", "warning"):
+    has_entry_issues = False
+    has_entry_issues |= _append_hooks_list_issues(messages, entry, "errors", "error")
+    has_entry_issues |= _append_hooks_list_issues(
+        messages, entry, "warnings", "warning"
+    )
+    if has_entry_issues:
         return False, messages
     codex_hooks = entry.get("hooks")
     if not isinstance(codex_hooks, list):

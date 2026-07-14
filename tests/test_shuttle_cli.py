@@ -166,7 +166,12 @@ def emit(message):
 
 
 def hook_metadata(cwd):
-    hooks_path = Path(os.environ["HOME"]) / ".codex" / "hooks.json"
+    codex_home = Path(os.environ["CODEX_HOME"])
+    log_path = os.environ.get("FAKE_CODEX_HOME_LOG")
+    if log_path:
+        with open(log_path, "a", encoding="utf-8") as stream:
+            stream.write(str(codex_home) + "\n")
+    hooks_path = codex_home / "hooks.json"
     document = json.loads(hooks_path.read_text(encoding="utf-8"))
     status = os.environ.get("FAKE_CODEX_TRUST_STATUS", "trusted")
     enabled = os.environ.get("FAKE_CODEX_ENABLED", "1") != "0"
@@ -236,6 +241,24 @@ for line in sys.stdin:
                         "hooks": [],
                         "warnings": [],
                         "errors": [{"path": "hooks.json", "message": "bad hook"}],
+                    }
+                ]
+            }
+        elif mode == "hook_errors_and_warnings":
+            result = {
+                "data": [
+                    {
+                        "cwd": cwd,
+                        "hooks": [],
+                        "warnings": [
+                            "/tmp/broken-hooks.json: missing field `command`"
+                        ],
+                        "errors": [
+                            {
+                                "path": "/tmp/error-hooks.json",
+                                "message": "bad hook",
+                            }
+                        ],
                     }
                 ]
             }
@@ -566,6 +589,7 @@ def test_hooks_snippet_and_doctor_never_write_dotfiles(cli_env) -> None:
     snippet = run_cli(env, "hooks")
     assert snippet.returncode == 0
     assert b"not a replacement" in snippet.stdout
+    assert b"CODEX_HOME/hooks.json or ~/.codex/hooks.json" in snippet.stdout
     assert b"Exact ~/.codex/hooks.json" not in snippet.stdout
     for event in (b"SessionStart", b"UserPromptSubmit", b"PermissionRequest", b"Stop"):
         assert event in snippet.stdout
@@ -596,6 +620,120 @@ def test_hooks_install_creates_missing_hooks_file_without_config_writes(cli_env)
     installed = json.loads(hooks.read_text(encoding="utf-8"))
     for event in HOOK_EVENTS:
         assert hook_coords(installed, event) == [(0, 0)]
+
+
+def test_hooks_install_and_doctor_honor_codex_home_env(cli_env, tmp_path: Path) -> None:
+    env, _ = cli_env
+    install_fake_codex_app_server(env)
+    user_home = Path(env["HOME"])
+    default_codex_dir = user_home / ".codex"
+    codex_home = tmp_path / "custom-codex-home"
+    hooks = codex_home / "hooks.json"
+    config = codex_home / "config.toml"
+    probe_log = tmp_path / "codex-home.log"
+    env["CODEX_HOME"] = str(codex_home)
+    env["FAKE_CODEX_HOME_LOG"] = str(probe_log)
+
+    installed = run_cli(env, "hooks", "install")
+
+    assert installed.returncode == 0, installed.stderr.decode()
+    assert f"updated: {hooks}".encode() in installed.stdout
+    assert hooks.exists()
+    assert not default_codex_dir.exists()
+    assert not config.exists()
+
+    doctor = run_cli(env, "hooks", "doctor")
+
+    assert doctor.returncode == 0, doctor.stderr.decode()
+    assert f"configured: {hooks}".encode() in doctor.stdout
+    assert b"all Shuttle Codex hooks are trusted and enabled" in doctor.stdout
+    assert probe_log.read_text(encoding="utf-8").splitlines() == [str(codex_home)]
+    assert not default_codex_dir.exists()
+    assert not config.exists()
+
+
+def test_hooks_install_and_doctor_default_codex_home_without_env(
+    cli_env, tmp_path: Path
+) -> None:
+    env, _ = cli_env
+    install_fake_codex_app_server(env)
+    env.pop("CODEX_HOME", None)
+    codex_home = Path(env["HOME"]) / ".codex"
+    hooks = codex_home / "hooks.json"
+    probe_log = tmp_path / "codex-home.log"
+    env["FAKE_CODEX_HOME_LOG"] = str(probe_log)
+
+    installed = run_cli(env, "hooks", "install")
+
+    assert installed.returncode == 0, installed.stderr.decode()
+    assert f"updated: {hooks}".encode() in installed.stdout
+    assert hooks.exists()
+
+    doctor = run_cli(env, "hooks", "doctor")
+
+    assert doctor.returncode == 0, doctor.stderr.decode()
+    assert f"configured: {hooks}".encode() in doctor.stdout
+    assert b"all Shuttle Codex hooks are trusted and enabled" in doctor.stdout
+    assert probe_log.read_text(encoding="utf-8").splitlines() == [str(codex_home)]
+
+
+def test_hooks_explicit_home_ignores_codex_home_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    explicit_home = tmp_path / "explicit-home"
+    env_codex_home = tmp_path / "env-codex-home"
+    hooks = explicit_home / ".codex" / "hooks.json"
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(env_codex_home))
+
+    installed = shuttle_cli.install_hooks(explicit_home)
+
+    assert installed.path == hooks
+    assert hooks.exists()
+    assert not (env_codex_home / "hooks.json").exists()
+
+    captured_probe_homes: list[Path] = []
+
+    def trust_probe(home: Path, probe_cwd: Path) -> shuttle_cli.HookTrustProbeResult:
+        captured_probe_homes.append(home)
+        metadata = []
+        for event in HOOK_EVENTS:
+            metadata.append(
+                {
+                    "key": (
+                        f"{hooks}:{shuttle_cli._codex_event_key(event)}:0:0"
+                    ),
+                    "source": "user",
+                    "sourcePath": str(hooks),
+                    "eventName": shuttle_cli._codex_event_name(event),
+                    "handlerType": "command",
+                    "command": HOOK_COMMAND["command"],
+                    "currentHash": "sha256:test",
+                    "enabled": True,
+                    "trustStatus": "trusted",
+                }
+            )
+        return shuttle_cli.HookTrustProbeResult(
+            data=[
+                {
+                    "cwd": str(probe_cwd),
+                    "hooks": metadata,
+                    "warnings": [],
+                    "errors": [],
+                }
+            ]
+        )
+
+    healthy, messages = shuttle_cli.hooks_diagnostics(
+        explicit_home, trust_probe=trust_probe, cwd=cwd
+    )
+
+    assert healthy
+    assert captured_probe_homes == [explicit_home]
+    assert f"configured: {hooks}" in messages
+    assert "all Shuttle Codex hooks are trusted and enabled" in messages
+    assert not (env_codex_home / "hooks.json").exists()
 
 
 def test_hooks_install_additively_merges_and_preserves_existing_hooks(
@@ -849,6 +987,30 @@ def test_hooks_doctor_reports_app_server_hook_warnings(cli_env) -> None:
     result = run_cli(env, "hooks", "doctor")
 
     assert result.returncode == 1
+    assert b"trust unverified: Codex hooks/list returned hook warnings" in result.stdout
+    assert (
+        b"hook warning: /tmp/broken-hooks.json: missing field `command`"
+        in result.stdout
+    )
+    assert b"Codex did not report Shuttle hook" not in result.stdout
+
+
+def test_hooks_doctor_reports_app_server_hook_errors_and_warnings(cli_env) -> None:
+    env, _ = cli_env
+    install_fake_codex_app_server(env)
+    env["FAKE_CODEX_APP_SERVER_MODE"] = "hook_errors_and_warnings"
+    codex_dir = Path(env["HOME"]) / ".codex"
+    codex_dir.mkdir()
+    hooks = codex_dir / "hooks.json"
+    write_json(
+        hooks, {"hooks": {event: [{"hooks": [HOOK_COMMAND]}] for event in HOOK_EVENTS}}
+    )
+
+    result = run_cli(env, "hooks", "doctor")
+
+    assert result.returncode == 1
+    assert b"trust unverified: Codex hooks/list returned hook errors" in result.stdout
+    assert b"hook error: /tmp/error-hooks.json: bad hook" in result.stdout
     assert b"trust unverified: Codex hooks/list returned hook warnings" in result.stdout
     assert (
         b"hook warning: /tmp/broken-hooks.json: missing field `command`"

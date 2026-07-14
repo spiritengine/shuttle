@@ -1966,14 +1966,14 @@ $CONTENT
         HOOK_ACTION="${1:-snippet}"
         case "$HOOK_ACTION" in
             snippet|show)
-                echo "Shuttle Codex hook fragment for additive merge into ~/.codex/hooks.json (not a replacement):"
+                echo "Shuttle Codex hook fragment for additive merge into CODEX_HOME/hooks.json or ~/.codex/hooks.json (not a replacement):"
                 registry_cli hooks-snippet
                 ;;
             install)
                 registry_cli hooks-install
                 ;;
             doctor|check)
-                echo "Shuttle Codex hook fragment for additive merge into ~/.codex/hooks.json (not a replacement):"
+                echo "Shuttle Codex hook fragment for additive merge into CODEX_HOME/hooks.json or ~/.codex/hooks.json (not a replacement):"
                 registry_cli hooks-snippet
                 echo ""
                 if registry_cli hooks-doctor; then
