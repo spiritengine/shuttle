@@ -754,7 +754,7 @@ def test_hooks_install_additively_merges_and_preserves_existing_hooks(
         "extra": "stale",
     }
     existing = {
-        "top_level": {"preserve": ["anything"]},
+        "description": "  Existing Codex hook description stays exact.  ",
         "hooks": {
             "SessionStart": [
                 {"matcher": "startup", "hooks": [unrelated_hook]},
@@ -769,7 +769,6 @@ def test_hooks_install_additively_merges_and_preserves_existing_hooks(
                 {"matcher": "other", "hooks": [{"type": "command", "command": "true"}]},
             ],
         },
-        "another_top_level_key": 42,
     }
     write_json(hooks, existing)
     hooks.chmod(0o640)
@@ -781,8 +780,7 @@ def test_hooks_install_additively_merges_and_preserves_existing_hooks(
     assert result.returncode == 0, result.stderr.decode()
     assert b"updated:" in result.stdout
     installed = json.loads(hooks.read_text(encoding="utf-8"))
-    assert installed["top_level"] == existing["top_level"]
-    assert installed["another_top_level_key"] == 42
+    assert installed["description"] == existing["description"]
     assert installed["hooks"]["OtherEvent"] == existing["hooks"]["OtherEvent"]
     assert installed["hooks"]["SessionStart"][0] == existing["hooks"]["SessionStart"][0]
     assert installed["hooks"]["SessionStart"][1] == {"hooks": [HOOK_COMMAND]}
@@ -1096,6 +1094,32 @@ def test_hooks_install_refuses_malformed_unknown_event_before_backup(cli_env) ->
     assert result.returncode == 1
     assert b"hooks.UnknownEvent[0].hooks[0] must be an object" in result.stderr
     assert hooks.read_bytes() == body
+    assert config.read_text(encoding="utf-8") == "sentinel = true\n"
+    assert not list(codex_dir.glob("hooks.json.shuttle.*.bak"))
+    assert not list(codex_dir.glob(".hooks.json.*.tmp"))
+
+
+def test_hooks_install_refuses_unknown_top_level_key_before_backup(cli_env) -> None:
+    env, _ = cli_env
+    codex_dir = Path(env["HOME"]) / ".codex"
+    codex_dir.mkdir()
+    hooks = codex_dir / "hooks.json"
+    config = codex_dir / "config.toml"
+    body = (
+        b'{"description":"keep","metadata":{"unsupported":true},'
+        b'"hooks":{"SessionStart":[]}}\n'
+    )
+    hooks.write_bytes(body)
+    hooks.chmod(0o640)
+    config.write_text("sentinel = true\n", encoding="utf-8")
+
+    result = run_cli(env, "hooks", "install")
+
+    assert result.returncode == 1
+    assert b"top-level key 'metadata' is not supported" in result.stderr
+    assert b"allowed keys: description, hooks" in result.stderr
+    assert hooks.read_bytes() == body
+    assert S_IMODE(hooks.stat().st_mode) == 0o640
     assert config.read_text(encoding="utf-8") == "sentinel = true\n"
     assert not list(codex_dir.glob("hooks.json.shuttle.*.bak"))
     assert not list(codex_dir.glob(".hooks.json.*.tmp"))

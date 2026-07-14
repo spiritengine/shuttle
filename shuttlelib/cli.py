@@ -38,6 +38,8 @@ HOOK_COMMAND = {
     "timeout": 12,
 }
 HOOK_HANDLER_TYPES = ("command", "prompt", "agent")
+# Codex 0.144.3 rejects any other hooks.json top-level keys.
+CODEX_HOOK_TOP_LEVEL_KEYS = frozenset(("description", "hooks"))
 
 
 class HookConfigError(ValueError):
@@ -134,6 +136,13 @@ def _is_optional_bool(value: Any) -> bool:
 def _hook_shape_errors(document: Any, *, require_hooks: bool) -> list[str]:
     if not isinstance(document, dict):
         return ["hooks.json must contain a JSON object"]
+    allowed_keys = ", ".join(sorted(CODEX_HOOK_TOP_LEVEL_KEYS))
+    for key in document:
+        if key not in CODEX_HOOK_TOP_LEVEL_KEYS:
+            return [
+                f"top-level key {key!r} is not supported; "
+                f"allowed keys: {allowed_keys}"
+            ]
     hooks = document.get("hooks")
     if hooks is None:
         if require_hooks:
