@@ -637,6 +637,265 @@ def _skein_finds_nothing(env: dict[str, str]) -> None:
     _executable(bin_dir / "skein", "import sys\n")
 
 
+def _skein_always_fails(env: dict[str, str], message: str) -> None:
+    # Models skein being down, or a `-p` name it does not recognize: every
+    # invocation exits non-zero, writes an error to stderr, and — like real
+    # skein on failure — prints nothing to stdout.
+    bin_dir = Path(env["PATH"].split(":", 1)[0])
+    _executable(
+        bin_dir / "skein",
+        "import sys\n"
+        f"sys.stderr.write({message!r} + chr(10))\n"
+        "sys.exit(1)\n",
+    )
+
+
+def _skein_global_match_fixture(env: dict[str, str], real_project: str, decoy_project: str) -> None:
+    # Models skein's real behavior, confirmed against the live server: a BARE
+    # (non `--all`) `skein folio <id>` lookup cascades GLOBALLY and succeeds
+    # regardless of SKEIN_PROJECT scope. When the scope just queried differs from
+    # the true owner, the render line carries an "[owner]" tag ("folio <id>
+    # [owner]"); when the scope queried IS the owner, the tag is omitted ("folio
+    # <id>"). That tag is a real ~/.skein/projects.json key — verified by scoping
+    # a bare lookup to several different non-owning projects and always getting the
+    # same "[owner]" back, and to the true owner and getting no tag at all.
+    #
+    # `--all`, by contrast, lists EVERY project holding a synced copy (all of them,
+    # for a mesh-shared brief — confirmed empirically: 53/53 registered projects
+    # matched a single brief) each with a DIFFERENT "[project]" tag that is just
+    # whichever project that particular hit came from, and a `site_id` that names a
+    # SITE/workspace, not a projects.json key. A fix that parses `--all`'s tag or
+    # its JSON `site_id` instead of the bare lookup's own tag must fail this test.
+    bin_dir = Path(env["PATH"].split(":", 1)[0])
+    _executable(
+        bin_dir / "skein",
+        "import json, os, sys\n"
+        "argv = sys.argv[1:]\n"
+        "if len(argv) >= 2 and argv[0] == 'folio':\n"
+        "    rest = argv[1:]\n"
+        "    folio_id = next(a for a in rest if not a.startswith('--'))\n"
+        "    if '--all' in rest:\n"
+        "        if '--json' in rest:\n"
+        "            print(json.dumps({'results': [\n"
+        f"                {{'folio_id': folio_id, 'site_id': 'mesh-workspace', 'source_project': {decoy_project!r}}},\n"
+        f"                {{'folio_id': folio_id, 'site_id': 'mesh-workspace', 'source_project': {real_project!r}}},\n"
+        "            ]}))\n"
+        "        else:\n"
+        f"            print('folio ' + folio_id + ' [{decoy_project}]')\n"
+        f"            print('folio ' + folio_id + ' [{real_project}]')\n"
+        "        sys.exit(0)\n"
+        "    scope = os.environ.get('SKEIN_PROJECT', '')\n"
+        f"    if scope == {real_project!r}:\n"
+        "        print('folio ' + folio_id)\n"
+        "    else:\n"
+        f"        print('folio ' + folio_id + ' [{real_project}]')\n"
+        "    print('    # Cross Project Brief')\n"
+        "    sys.exit(0)\n",
+    )
+
+
+def _skein_unscoped_cwd_fixture(env: dict[str, str], real_project: str) -> None:
+    # Models skein when the invoking cwd has no resolvable SKEIN scope at all
+    # (/tmp, $HOME, a bare ~/projects with no .skein): the AMBIENT bare lookup
+    # (no SKEIN_PROJECT set) errors "No project specified" with EMPTY stdout,
+    # before the global-owner cascade in _skein_global_match_fixture ever gets
+    # a chance to run. Once given an EXPLICIT SKEIN_PROJECT (any registered
+    # project acting as a probe scope), the cascade runs exactly like that
+    # fixture and finds the real owner.
+    bin_dir = Path(env["PATH"].split(":", 1)[0])
+    _executable(
+        bin_dir / "skein",
+        "import os, sys\n"
+        "argv = sys.argv[1:]\n"
+        "if len(argv) >= 2 and argv[0] == 'folio':\n"
+        "    rest = argv[1:]\n"
+        "    folio_id = next(a for a in rest if not a.startswith('--'))\n"
+        "    scope = os.environ.get('SKEIN_PROJECT')\n"
+        "    if not scope:\n"
+        "        sys.stderr.write('No project specified\\n')\n"
+        "        sys.exit(1)\n"
+        f"    if scope == {real_project!r}:\n"
+        "        print('folio ' + folio_id)\n"
+        "    else:\n"
+        f"        print('folio ' + folio_id + ' [{real_project}]')\n"
+        "    print('    # Cross Project Brief')\n"
+        "    sys.exit(0)\n",
+    )
+
+
+def _register_projects(tmp_path: Path, env: dict[str, str], real_project: str, decoy_project: str) -> tuple[Path, Path]:
+    # decoy_project sorts before real_project, so any leftover "first hit wins"
+    # logic — over `--all`'s results, or a per-project scan — would land on the
+    # decoy; that's the exact failure mode this is designed to catch.
+    home = Path(env["HOME"])
+    skein_dir = home / ".skein"
+    skein_dir.mkdir(parents=True)
+    decoy_dir = tmp_path / "decoy"
+    real_dir = tmp_path / "real"
+    decoy_dir.mkdir()
+    real_dir.mkdir()
+    write_json(
+        skein_dir / "projects.json",
+        {
+            "projects": {
+                decoy_project: {"path": str(decoy_dir)},
+                real_project: {"path": str(real_dir)},
+            }
+        },
+    )
+    return decoy_dir, real_dir
+
+
+def test_go_reports_skein_failure_instead_of_dying_silently(cli_env) -> None:
+    # `VAR=$(cmd)` takes cmd's exit status as its own: a bare failing assignment
+    # aborts the whole script under `set -e` with ZERO output. skein returning
+    # non-zero (down, or a `-p` name it doesn't recognize) must degrade to a
+    # clear, non-zero, non-silent failure instead of a mute crash.
+    env, _ = cli_env
+    _skein_always_fails(env, "Project 'skein' not found in registry")
+
+    result = run_cli(env, "go", "brief-down", timeout=30)
+
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert combined.strip() != b"", "go died silently instead of reporting the failure"
+    assert b"brief-down" in combined, combined
+    assert b"not found in registry" in combined, combined
+
+
+def test_go_resolves_cross_project_brief_to_its_real_owner_not_first_alphabetical(
+    cli_env, tmp_path: Path
+) -> None:
+    # `skein folio <id>` resolves globally and succeeds from any pwd, so the bare
+    # lookup `go` already does for Bug 1 always finds the brief — BRIEF_FOUND is
+    # set even when PROJECT_DIR (still pwd) is the wrong directory. The fix must
+    # notice the lookup's own "[owner]" tag and resolve to that project ALWAYS,
+    # not only when the bare lookup failed outright.
+    env, _ = cli_env
+    _skein_global_match_fixture(env, real_project="zzz-project", decoy_project="aaa-project")
+    _decoy_dir, real_dir = _register_projects(tmp_path, env, "zzz-project", "aaa-project")
+
+    result = run_cli(env, "go", "brief-cross", timeout=30)
+
+    assert result.returncode == 0, result.stderr.decode()
+    launch = Registry(env["SHUTTLE_HOME"]).list_launches()[-1]
+    assert launch["cwd"] == str(real_dir), launch
+
+
+def test_split_reports_skein_failure_instead_of_dying_silently(cli_env) -> None:
+    # Same failure mode as 'go', at the split case's own bare BRIEF_CHECK assignment.
+    env, _ = cli_env
+    env["TMUX"] = "/tmp/fake-tmux,1,0"
+    _skein_always_fails(env, "Project 'skein' not found in registry")
+
+    result = run_cli(env, "split", "brief-down", timeout=30)
+
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert combined.strip() != b"", "split died silently instead of reporting the failure"
+    assert b"brief-down" in combined, combined
+    assert b"not found in registry" in combined, combined
+
+
+def test_split_resolves_cross_project_brief_to_its_real_owner_not_first_alphabetical(
+    cli_env, tmp_path: Path
+) -> None:
+    env, log = cli_env
+    env["TMUX"] = "/tmp/fake-tmux,1,0"
+    _skein_global_match_fixture(env, real_project="zzz-project", decoy_project="aaa-project")
+    _decoy_dir, real_dir = _register_projects(tmp_path, env, "zzz-project", "aaa-project")
+
+    result = run_cli(env, "split", "brief-cross", timeout=30)
+
+    assert result.returncode == 0, result.stderr.decode()
+    split_call = next(call for call in tmux_calls(log) if call[0] == "split-window")
+    assert split_call[split_call.index("-c") + 1] == str(real_dir), split_call
+
+
+def test_go_resolves_cross_project_brief_from_an_unscoped_cwd(
+    cli_env, tmp_path: Path
+) -> None:
+    # /tmp, $HOME, a bare ~/projects with no .skein: the ambient bare lookup
+    # (no SKEIN_PROJECT, no .skein dir to walk up to) errors "No project
+    # specified" with EMPTY stdout before the owner cascade ever runs. A fix
+    # that only retries the SAME ambient scope, or gives up the moment the
+    # first lookup errors, reports a false "brief not found" for a brief that
+    # genuinely exists — resolution must fall back to an explicit,
+    # guaranteed-registered scope instead of depending on the invoking cwd.
+    env, _ = cli_env
+    env.pop("SKEIN_PROJECT", None)
+    _skein_unscoped_cwd_fixture(env, real_project="zzz-project")
+    home = Path(env["HOME"])
+    skein_dir = home / ".skein"
+    skein_dir.mkdir(parents=True)
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    write_json(
+        skein_dir / "projects.json",
+        {
+            "projects": {
+                "shuttle": {"path": str(tmp_path / "shuttle-probe-scope")},
+                "zzz-project": {"path": str(real_dir)},
+            }
+        },
+    )
+
+    result = run_cli(env, "go", "brief-cross", timeout=30)
+
+    assert result.returncode == 0, result.stderr.decode()
+    launch = Registry(env["SHUTTLE_HOME"]).list_launches()[-1]
+    assert launch["cwd"] == str(real_dir), launch
+
+
+def test_split_resolves_cross_project_brief_from_an_unscoped_cwd(
+    cli_env, tmp_path: Path
+) -> None:
+    env, log = cli_env
+    env["TMUX"] = "/tmp/fake-tmux,1,0"
+    env.pop("SKEIN_PROJECT", None)
+    _skein_unscoped_cwd_fixture(env, real_project="zzz-project")
+    home = Path(env["HOME"])
+    skein_dir = home / ".skein"
+    skein_dir.mkdir(parents=True)
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    write_json(
+        skein_dir / "projects.json",
+        {
+            "projects": {
+                "shuttle": {"path": str(tmp_path / "shuttle-probe-scope")},
+                "zzz-project": {"path": str(real_dir)},
+            }
+        },
+    )
+
+    result = run_cli(env, "split", "brief-cross", timeout=30)
+
+    assert result.returncode == 0, result.stderr.decode()
+    split_call = next(call for call in tmux_calls(log) if call[0] == "split-window")
+    assert split_call[split_call.index("-c") + 1] == str(real_dir), split_call
+
+
+def test_go_with_explicit_project_flag_keeps_its_own_directory_despite_owner_tag(
+    cli_env,
+) -> None:
+    # Round-2 fell flagged this path as untested: an explicit -p must pin the
+    # directory even when the bare lookup's global cascade reports the brief
+    # is actually owned by a DIFFERENT project. -p is a deliberate user
+    # override, not a hint to relocate.
+    env, _ = cli_env
+    _skein_global_match_fixture(env, real_project="zzz-project", decoy_project="aaa-project")
+    home = Path(env["HOME"])
+    pinned_dir = home / "projects" / "aaa-project"
+    pinned_dir.mkdir(parents=True)
+
+    result = run_cli(env, "go", "-p", "aaa-project", "brief-cross", timeout=30)
+
+    assert result.returncode == 0, result.stderr.decode()
+    launch = Registry(env["SHUTTLE_HOME"]).list_launches()[-1]
+    assert launch["cwd"] == str(pinned_dir), launch
+
+
 def test_go_sanitizes_a_raw_brief_id_into_the_session_name(cli_env, tmp_path: Path) -> None:
     # With -d explicit and the brief not found, `go` builds the session name straight
     # from the RAW brief id. tmux rejects '.'/':' and mis-parses '|'/newline/space, so
