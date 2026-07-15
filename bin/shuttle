@@ -1898,10 +1898,15 @@ $CONTENT
 
         # Check if brief exists and extract title for session name
         # Use explicit project if -p was provided, otherwise SKEIN auto-detects from pwd
+        # `VAR=$(cmd)` takes cmd's exit status as its own: a bare failing assignment
+        # kills the whole script under `set -e`, with no message. `|| true` on the
+        # whole statement neutralizes that while still capturing whatever skein
+        # printed — its own error text on failure, since skein writes nothing to
+        # stdout when it errors (2>&1 folds that text into BRIEF_OUTPUT).
         if [ -n "$PROJECT_NAME" ]; then
-            BRIEF_OUTPUT=$(SKEIN_PROJECT="$PROJECT_NAME" skein folio "$BRIEF_ID" 2>/dev/null)
+            BRIEF_OUTPUT=$(SKEIN_PROJECT="$PROJECT_NAME" skein folio "$BRIEF_ID" 2>&1) || true
         else
-            BRIEF_OUTPUT=$(skein folio "$BRIEF_ID" 2>/dev/null)
+            BRIEF_OUTPUT=$(skein folio "$BRIEF_ID" 2>&1) || true
         fi
         BRIEF_FOUND=""
         BRIEF_TITLE=""
@@ -1910,26 +1915,32 @@ $CONTENT
             BRIEF_TITLE=$(brief_title_slug "$BRIEF_OUTPUT")
         fi
 
-        # If not found in current project, search other registered projects
+        # If not found in current project, search other registered projects.
         # Skip cross-project search if user explicitly set a directory with -d
         if [ -z "$BRIEF_FOUND" ] && [ -z "$EXPLICIT_DIR" ]; then
             FOUND_PROJECT=""
             FOUND_PROJECT_DIR=""
-            # Get list of registered projects from SKEIN
-            if [ -f ~/.skein/projects.json ]; then
-                for SEARCH_PROJECT in $(jq -r '.projects | keys[]' ~/.skein/projects.json 2>/dev/null); do
-                    SEARCH_OUTPUT=$(SKEIN_PROJECT="$SEARCH_PROJECT" skein folio "$BRIEF_ID" 2>/dev/null)
-                    if echo "$SEARCH_OUTPUT" | grep -q "^folio $BRIEF_ID"; then
-                        FOUND_PROJECT="$SEARCH_PROJECT"
-                        FOUND_PROJECT_DIR=$(jq -r ".projects[\"$SEARCH_PROJECT\"].path // empty" ~/.skein/projects.json 2>/dev/null)
-                        BRIEF_TITLE=$(brief_title_slug "$SEARCH_OUTPUT")
-                        break
-                    fi
-                done
+            # `skein folio <id>` resolves globally now, so scoping SKEIN_PROJECT to
+            # each registered project in turn and taking the first hit (the old
+            # approach) always matched on the very first project — alphabetically —
+            # the wrong directory, silently. `--all --json`'s embedded `site_id` is
+            # the real owner; the plain-text `--all` output's "[project]" tag is NOT
+            # trustworthy — it is just whichever project happened to be queried when
+            # the (globally resolving) match came back, not a verified owner.
+            GLOBAL_OUTPUT=$(skein folio --all "$BRIEF_ID" --json 2>/dev/null) || true
+            if [ -n "$GLOBAL_OUTPUT" ]; then
+                FOUND_PROJECT=$(echo "$GLOBAL_OUTPUT" | jq -r '.results[0].site_id // empty' 2>/dev/null) || true
+            fi
+            if [ -n "$FOUND_PROJECT" ] && [ -f ~/.skein/projects.json ]; then
+                FOUND_PROJECT_DIR=$(jq -r ".projects[\"$FOUND_PROJECT\"].path // empty" ~/.skein/projects.json 2>/dev/null) || true
             fi
 
             if [ -n "$FOUND_PROJECT" ] && [ -n "$FOUND_PROJECT_DIR" ] && [ -d "$FOUND_PROJECT_DIR" ]; then
-                # Auto-resolve: switch to the project that owns this brief
+                # Auto-resolve: switch to the project that owns this brief. Re-fetch
+                # project-qualified so the title reflects the confirmed owner, using
+                # the same rendered text format the primary lookup produces.
+                REFETCH_OUTPUT=$(skein folio "$FOUND_PROJECT:$BRIEF_ID" 2>/dev/null) || true
+                BRIEF_TITLE=$(brief_title_slug "$REFETCH_OUTPUT")
                 echo "Brief found in: $FOUND_PROJECT ($FOUND_PROJECT_DIR)"
                 PROJECT_DIR="$FOUND_PROJECT_DIR"
                 SESSION="shuttle-$(safe_session_name "${BRIEF_TITLE:-$BRIEF_ID}")"
@@ -1942,6 +1953,9 @@ $CONTENT
                 # Not found in any registered project
                 echo "Brief not found: $BRIEF_ID"
                 echo "Not found in current project or any registered SKEIN project."
+                if [ -n "$BRIEF_OUTPUT" ]; then
+                    echo "$BRIEF_OUTPUT"
+                fi
                 exit 1
             fi
         elif [ -z "$BRIEF_TITLE" ]; then
@@ -2063,24 +2077,27 @@ $CONTENT
         # Cross-project resolution (same logic as 'go')
         BRIEF_FOUND=""
         if [ -z "$EXPLICIT_DIR" ]; then
+            # `|| true` on the whole statement: see 'go' for why a bare `VAR=$(cmd)`
+            # is fatal under `set -e`, and why merging 2>&1 into BRIEF_CHECK keeps
+            # skein's own error text available for the final failure message.
             if [ -n "$PROJECT_NAME" ]; then
-                BRIEF_CHECK=$(SKEIN_PROJECT="$PROJECT_NAME" skein folio "$BRIEF_ID" 2>/dev/null)
+                BRIEF_CHECK=$(SKEIN_PROJECT="$PROJECT_NAME" skein folio "$BRIEF_ID" 2>&1) || true
             else
-                BRIEF_CHECK=$(skein folio "$BRIEF_ID" 2>/dev/null)
+                BRIEF_CHECK=$(skein folio "$BRIEF_ID" 2>&1) || true
             fi
             if echo "$BRIEF_CHECK" | grep -q "^folio $BRIEF_ID"; then
                 BRIEF_FOUND=1
             else
                 FOUND_PROJECT=""
                 FOUND_PROJECT_DIR=""
-                if [ -f ~/.skein/projects.json ]; then
-                    for SEARCH_PROJECT in $(jq -r '.projects | keys[]' ~/.skein/projects.json 2>/dev/null); do
-                        if SKEIN_PROJECT="$SEARCH_PROJECT" skein folio "$BRIEF_ID" 2>/dev/null | grep -q "^folio $BRIEF_ID"; then
-                            FOUND_PROJECT="$SEARCH_PROJECT"
-                            FOUND_PROJECT_DIR=$(jq -r ".projects[\"$SEARCH_PROJECT\"].path // empty" ~/.skein/projects.json 2>/dev/null)
-                            break
-                        fi
-                    done
+                # See 'go': `--all --json`'s embedded site_id is the real owner;
+                # the plain-text `--all` output's "[project]" tag is not trustworthy.
+                GLOBAL_OUTPUT=$(skein folio --all "$BRIEF_ID" --json 2>/dev/null) || true
+                if [ -n "$GLOBAL_OUTPUT" ]; then
+                    FOUND_PROJECT=$(echo "$GLOBAL_OUTPUT" | jq -r '.results[0].site_id // empty' 2>/dev/null) || true
+                fi
+                if [ -n "$FOUND_PROJECT" ] && [ -f ~/.skein/projects.json ]; then
+                    FOUND_PROJECT_DIR=$(jq -r ".projects[\"$FOUND_PROJECT\"].path // empty" ~/.skein/projects.json 2>/dev/null) || true
                 fi
                 if [ -n "$FOUND_PROJECT" ] && [ -n "$FOUND_PROJECT_DIR" ] && [ -d "$FOUND_PROJECT_DIR" ]; then
                     echo "Brief found in: $FOUND_PROJECT ($FOUND_PROJECT_DIR)"
@@ -2093,6 +2110,9 @@ $CONTENT
                 else
                     echo "Brief not found: $BRIEF_ID"
                     echo "Not found in current project or any registered SKEIN project."
+                    if [ -n "$BRIEF_CHECK" ]; then
+                        echo "$BRIEF_CHECK"
+                    fi
                     exit 1
                 fi
             fi

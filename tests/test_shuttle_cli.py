@@ -637,6 +637,138 @@ def _skein_finds_nothing(env: dict[str, str]) -> None:
     _executable(bin_dir / "skein", "import sys\n")
 
 
+def _skein_always_fails(env: dict[str, str], message: str) -> None:
+    # Models skein being down, or a `-p` name it does not recognize: every
+    # invocation exits non-zero, writes an error to stderr, and — like real
+    # skein on failure — prints nothing to stdout.
+    bin_dir = Path(env["PATH"].split(":", 1)[0])
+    _executable(
+        bin_dir / "skein",
+        "import sys\n"
+        f"sys.stderr.write({message!r} + chr(10))\n"
+        "sys.exit(1)\n",
+    )
+
+
+def _skein_global_match_fixture(env: dict[str, str], real_project: str, decoy_project: str) -> None:
+    # Models skein's real behavior: `skein folio <id>` resolves GLOBALLY regardless
+    # of SKEIN_PROJECT scoping, so an unscoped or wrongly-scoped lookup fails, but
+    # `--all --json`'s embedded `site_id` names the true owner. The plain-text
+    # `--all` output carries a DIFFERENT, wrong "[project]" tag on purpose — that
+    # tag is just whichever project happened to be queried, not a verified owner,
+    # and a fix that parses it instead of the JSON site_id must fail this test.
+    bin_dir = Path(env["PATH"].split(":", 1)[0])
+    _executable(
+        bin_dir / "skein",
+        "import json, sys\n"
+        "argv = sys.argv[1:]\n"
+        "if len(argv) >= 2 and argv[0] == 'folio':\n"
+        "    rest = argv[1:]\n"
+        "    folio_id = next(a for a in rest if not a.startswith('--'))\n"
+        "    if '--all' in rest:\n"
+        "        if '--json' in rest:\n"
+        "            print(json.dumps({'results': [{'folio_id': folio_id,"
+        f" 'site_id': {real_project!r}, 'title': 'Cross Project Brief'}}]}}))\n"
+        "        else:\n"
+        f"            print('folio ' + folio_id + ' [{decoy_project}]')\n"
+        "        sys.exit(0)\n"
+        "    project, _, bare_id = folio_id.partition(':')\n"
+        f"    if project == {real_project!r}:\n"
+        "        print('folio ' + bare_id)\n"
+        "        print('    # Cross Project Brief')\n"
+        "        sys.exit(0)\n"
+        "    sys.exit(1)\n",
+    )
+
+
+def _register_projects(tmp_path: Path, env: dict[str, str], real_project: str, decoy_project: str) -> tuple[Path, Path]:
+    # decoy_project sorts before real_project, so a "first match wins" search
+    # over registry keys would land on the decoy — the exact failure mode this
+    # is designed to catch.
+    home = Path(env["HOME"])
+    skein_dir = home / ".skein"
+    skein_dir.mkdir(parents=True)
+    decoy_dir = tmp_path / "decoy"
+    real_dir = tmp_path / "real"
+    decoy_dir.mkdir()
+    real_dir.mkdir()
+    write_json(
+        skein_dir / "projects.json",
+        {
+            "projects": {
+                decoy_project: {"path": str(decoy_dir)},
+                real_project: {"path": str(real_dir)},
+            }
+        },
+    )
+    return decoy_dir, real_dir
+
+
+def test_go_reports_skein_failure_instead_of_dying_silently(cli_env) -> None:
+    # `VAR=$(cmd)` takes cmd's exit status as its own: a bare failing assignment
+    # aborts the whole script under `set -e` with ZERO output. skein returning
+    # non-zero (down, or a `-p` name it doesn't recognize) must degrade to a
+    # clear, non-zero, non-silent failure instead of a mute crash.
+    env, _ = cli_env
+    _skein_always_fails(env, "Project 'skein' not found in registry")
+
+    result = run_cli(env, "go", "brief-down", timeout=30)
+
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert combined.strip() != b"", "go died silently instead of reporting the failure"
+    assert b"brief-down" in combined, combined
+    assert b"not found in registry" in combined, combined
+
+
+def test_go_resolves_cross_project_brief_to_its_real_owner_not_first_alphabetical(
+    cli_env, tmp_path: Path
+) -> None:
+    # `skein folio <id>` now resolves globally, so the old "scope SKEIN_PROJECT to
+    # each registered project, take the first hit" search matched on the very
+    # first project alphabetically and launched in the wrong directory. The fix
+    # must resolve to the brief's REAL owner via `--all --json`'s site_id.
+    env, _ = cli_env
+    _skein_global_match_fixture(env, real_project="zzz-project", decoy_project="aaa-project")
+    _decoy_dir, real_dir = _register_projects(tmp_path, env, "zzz-project", "aaa-project")
+
+    result = run_cli(env, "go", "brief-cross", timeout=30)
+
+    assert result.returncode == 0, result.stderr.decode()
+    launch = Registry(env["SHUTTLE_HOME"]).list_launches()[-1]
+    assert launch["cwd"] == str(real_dir), launch
+
+
+def test_split_reports_skein_failure_instead_of_dying_silently(cli_env) -> None:
+    # Same failure mode as 'go', at the split case's own bare BRIEF_CHECK assignment.
+    env, _ = cli_env
+    env["TMUX"] = "/tmp/fake-tmux,1,0"
+    _skein_always_fails(env, "Project 'skein' not found in registry")
+
+    result = run_cli(env, "split", "brief-down", timeout=30)
+
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert combined.strip() != b"", "split died silently instead of reporting the failure"
+    assert b"brief-down" in combined, combined
+    assert b"not found in registry" in combined, combined
+
+
+def test_split_resolves_cross_project_brief_to_its_real_owner_not_first_alphabetical(
+    cli_env, tmp_path: Path
+) -> None:
+    env, log = cli_env
+    env["TMUX"] = "/tmp/fake-tmux,1,0"
+    _skein_global_match_fixture(env, real_project="zzz-project", decoy_project="aaa-project")
+    _decoy_dir, real_dir = _register_projects(tmp_path, env, "zzz-project", "aaa-project")
+
+    result = run_cli(env, "split", "brief-cross", timeout=30)
+
+    assert result.returncode == 0, result.stderr.decode()
+    split_call = next(call for call in tmux_calls(log) if call[0] == "split-window")
+    assert split_call[split_call.index("-c") + 1] == str(real_dir), split_call
+
+
 def test_go_sanitizes_a_raw_brief_id_into_the_session_name(cli_env, tmp_path: Path) -> None:
     # With -d explicit and the brief not found, `go` builds the session name straight
     # from the RAW brief id. tmux rejects '.'/':' and mis-parses '|'/newline/space, so
