@@ -651,40 +651,53 @@ def _skein_always_fails(env: dict[str, str], message: str) -> None:
 
 
 def _skein_global_match_fixture(env: dict[str, str], real_project: str, decoy_project: str) -> None:
-    # Models skein's real behavior: `skein folio <id>` resolves GLOBALLY regardless
-    # of SKEIN_PROJECT scoping, so an unscoped or wrongly-scoped lookup fails, but
-    # `--all --json`'s embedded `site_id` names the true owner. The plain-text
-    # `--all` output carries a DIFFERENT, wrong "[project]" tag on purpose — that
-    # tag is just whichever project happened to be queried, not a verified owner,
-    # and a fix that parses it instead of the JSON site_id must fail this test.
+    # Models skein's real behavior, confirmed against the live server: a BARE
+    # (non `--all`) `skein folio <id>` lookup cascades GLOBALLY and succeeds
+    # regardless of SKEIN_PROJECT scope. When the scope just queried differs from
+    # the true owner, the render line carries an "[owner]" tag ("folio <id>
+    # [owner]"); when the scope queried IS the owner, the tag is omitted ("folio
+    # <id>"). That tag is a real ~/.skein/projects.json key — verified by scoping
+    # a bare lookup to several different non-owning projects and always getting the
+    # same "[owner]" back, and to the true owner and getting no tag at all.
+    #
+    # `--all`, by contrast, lists EVERY project holding a synced copy (all of them,
+    # for a mesh-shared brief — confirmed empirically: 53/53 registered projects
+    # matched a single brief) each with a DIFFERENT "[project]" tag that is just
+    # whichever project that particular hit came from, and a `site_id` that names a
+    # SITE/workspace, not a projects.json key. A fix that parses `--all`'s tag or
+    # its JSON `site_id` instead of the bare lookup's own tag must fail this test.
     bin_dir = Path(env["PATH"].split(":", 1)[0])
     _executable(
         bin_dir / "skein",
-        "import json, sys\n"
+        "import json, os, sys\n"
         "argv = sys.argv[1:]\n"
         "if len(argv) >= 2 and argv[0] == 'folio':\n"
         "    rest = argv[1:]\n"
         "    folio_id = next(a for a in rest if not a.startswith('--'))\n"
         "    if '--all' in rest:\n"
         "        if '--json' in rest:\n"
-        "            print(json.dumps({'results': [{'folio_id': folio_id,"
-        f" 'site_id': {real_project!r}, 'title': 'Cross Project Brief'}}]}}))\n"
+        "            print(json.dumps({'results': [\n"
+        f"                {{'folio_id': folio_id, 'site_id': 'mesh-workspace', 'source_project': {decoy_project!r}}},\n"
+        f"                {{'folio_id': folio_id, 'site_id': 'mesh-workspace', 'source_project': {real_project!r}}},\n"
+        "            ]}))\n"
         "        else:\n"
         f"            print('folio ' + folio_id + ' [{decoy_project}]')\n"
+        f"            print('folio ' + folio_id + ' [{real_project}]')\n"
         "        sys.exit(0)\n"
-        "    project, _, bare_id = folio_id.partition(':')\n"
-        f"    if project == {real_project!r}:\n"
-        "        print('folio ' + bare_id)\n"
-        "        print('    # Cross Project Brief')\n"
-        "        sys.exit(0)\n"
-        "    sys.exit(1)\n",
+        "    scope = os.environ.get('SKEIN_PROJECT', '')\n"
+        f"    if scope == {real_project!r}:\n"
+        "        print('folio ' + folio_id)\n"
+        "    else:\n"
+        f"        print('folio ' + folio_id + ' [{real_project}]')\n"
+        "    print('    # Cross Project Brief')\n"
+        "    sys.exit(0)\n",
     )
 
 
 def _register_projects(tmp_path: Path, env: dict[str, str], real_project: str, decoy_project: str) -> tuple[Path, Path]:
-    # decoy_project sorts before real_project, so a "first match wins" search
-    # over registry keys would land on the decoy — the exact failure mode this
-    # is designed to catch.
+    # decoy_project sorts before real_project, so any leftover "first hit wins"
+    # logic — over `--all`'s results, or a per-project scan — would land on the
+    # decoy; that's the exact failure mode this is designed to catch.
     home = Path(env["HOME"])
     skein_dir = home / ".skein"
     skein_dir.mkdir(parents=True)
@@ -724,10 +737,11 @@ def test_go_reports_skein_failure_instead_of_dying_silently(cli_env) -> None:
 def test_go_resolves_cross_project_brief_to_its_real_owner_not_first_alphabetical(
     cli_env, tmp_path: Path
 ) -> None:
-    # `skein folio <id>` now resolves globally, so the old "scope SKEIN_PROJECT to
-    # each registered project, take the first hit" search matched on the very
-    # first project alphabetically and launched in the wrong directory. The fix
-    # must resolve to the brief's REAL owner via `--all --json`'s site_id.
+    # `skein folio <id>` resolves globally and succeeds from any pwd, so the bare
+    # lookup `go` already does for Bug 1 always finds the brief — BRIEF_FOUND is
+    # set even when PROJECT_DIR (still pwd) is the wrong directory. The fix must
+    # notice the lookup's own "[owner]" tag and resolve to that project ALWAYS,
+    # not only when the bare lookup failed outright.
     env, _ = cli_env
     _skein_global_match_fixture(env, real_project="zzz-project", decoy_project="aaa-project")
     _decoy_dir, real_dir = _register_projects(tmp_path, env, "zzz-project", "aaa-project")

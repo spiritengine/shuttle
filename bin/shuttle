@@ -1910,61 +1910,70 @@ $CONTENT
         fi
         BRIEF_FOUND=""
         BRIEF_TITLE=""
-        if echo "$BRIEF_OUTPUT" | grep -q "^folio $BRIEF_ID"; then
+        BRIEF_OWNER=""
+        # A bare (non `--all`) `skein folio` lookup resolves GLOBALLY: it cascades to
+        # whichever registered project actually owns the brief and succeeds from any
+        # pwd/scope. When the owner differs from the scope just queried, the render
+        # line carries an "[owner]" tag ("folio $BRIEF_ID [owner]"); when the owner IS
+        # the scope just queried, the tag is omitted ("folio $BRIEF_ID"). That tag is
+        # a real ~/.skein/projects.json key. `--all`'s tag is NOT: `--all` lists every
+        # project holding a synced copy (all of them, for a mesh-shared brief) and its
+        # embedded `site_id` is a SITE/workspace name, a different namespace than a
+        # projects.json key — see friction-20260715-0yd7 for the corrected finding.
+        RENDER_LINE=$(echo "$BRIEF_OUTPUT" | grep "^folio $BRIEF_ID" | head -1)
+        if [ -n "$RENDER_LINE" ]; then
             BRIEF_FOUND=1
             BRIEF_TITLE=$(brief_title_slug "$BRIEF_OUTPUT")
+            case "$RENDER_LINE" in
+                "folio $BRIEF_ID ["*"]")
+                    BRIEF_OWNER="${RENDER_LINE#folio $BRIEF_ID [}"
+                    BRIEF_OWNER="${BRIEF_OWNER%]}"
+                    ;;
+            esac
         fi
 
-        # If not found in current project, search other registered projects.
-        # Skip cross-project search if user explicitly set a directory with -d
-        if [ -z "$BRIEF_FOUND" ] && [ -z "$EXPLICIT_DIR" ]; then
-            FOUND_PROJECT=""
-            FOUND_PROJECT_DIR=""
-            # `skein folio <id>` resolves globally now, so scoping SKEIN_PROJECT to
-            # each registered project in turn and taking the first hit (the old
-            # approach) always matched on the very first project — alphabetically —
-            # the wrong directory, silently. `--all --json`'s embedded `site_id` is
-            # the real owner; the plain-text `--all` output's "[project]" tag is NOT
-            # trustworthy — it is just whichever project happened to be queried when
-            # the (globally resolving) match came back, not a verified owner.
-            GLOBAL_OUTPUT=$(skein folio --all "$BRIEF_ID" --json 2>/dev/null) || true
-            if [ -n "$GLOBAL_OUTPUT" ]; then
-                FOUND_PROJECT=$(echo "$GLOBAL_OUTPUT" | jq -r '.results[0].site_id // empty' 2>/dev/null) || true
+        # Resolve the owner's directory whenever the brief cascaded in from a
+        # different project than the one just queried. This must run whenever an
+        # owner tag is present, NOT only when BRIEF_FOUND was empty: the bare lookup
+        # above succeeds globally, so BRIEF_FOUND is set even when PROJECT_DIR (still
+        # pwd, the wrong directory) was never corrected. Respect an explicit -d/-p —
+        # the user pinned a directory, so leave their choice alone.
+        if [ -n "$BRIEF_OWNER" ] && [ -z "$EXPLICIT_DIR" ] && [ -z "$PROJECT_NAME" ]; then
+            OWNER_DIR=""
+            if [ -f ~/.skein/projects.json ]; then
+                OWNER_DIR=$(jq -r ".projects[\"$BRIEF_OWNER\"].path // empty" ~/.skein/projects.json 2>/dev/null) || true
             fi
-            if [ -n "$FOUND_PROJECT" ] && [ -f ~/.skein/projects.json ]; then
-                FOUND_PROJECT_DIR=$(jq -r ".projects[\"$FOUND_PROJECT\"].path // empty" ~/.skein/projects.json 2>/dev/null) || true
-            fi
-
-            if [ -n "$FOUND_PROJECT" ] && [ -n "$FOUND_PROJECT_DIR" ] && [ -d "$FOUND_PROJECT_DIR" ]; then
-                # Auto-resolve: switch to the project that owns this brief. Re-fetch
-                # project-qualified so the title reflects the confirmed owner, using
-                # the same rendered text format the primary lookup produces.
-                REFETCH_OUTPUT=$(skein folio "$FOUND_PROJECT:$BRIEF_ID" 2>/dev/null) || true
+            if [ -n "$OWNER_DIR" ] && [ -d "$OWNER_DIR" ]; then
+                # Re-fetch scoped to the confirmed owner so the title reflects it,
+                # using the same rendered text format the primary lookup produces.
+                REFETCH_OUTPUT=$(SKEIN_PROJECT="$BRIEF_OWNER" skein folio "$BRIEF_ID" 2>/dev/null) || true
                 BRIEF_TITLE=$(brief_title_slug "$REFETCH_OUTPUT")
-                echo "Brief found in: $FOUND_PROJECT ($FOUND_PROJECT_DIR)"
-                PROJECT_DIR="$FOUND_PROJECT_DIR"
-                SESSION="shuttle-$(safe_session_name "${BRIEF_TITLE:-$BRIEF_ID}")"
-            elif [ -n "$FOUND_PROJECT" ]; then
-                # Found in SKEIN but can't resolve directory
-                echo "Brief belongs to project '$FOUND_PROJECT' but its path could not be resolved."
-                echo "Run: shuttle go -p $FOUND_PROJECT $BRIEF_ID"
-                exit 1
+                echo "Brief found in: $BRIEF_OWNER ($OWNER_DIR)"
+                PROJECT_DIR="$OWNER_DIR"
             else
-                # Not found in any registered project
-                echo "Brief not found: $BRIEF_ID"
-                echo "Not found in current project or any registered SKEIN project."
-                if [ -n "$BRIEF_OUTPUT" ]; then
-                    echo "$BRIEF_OUTPUT"
-                fi
+                # Owner tag present but its registered path is missing or stale.
+                # `-p $BRIEF_OWNER` assumes a `~/projects/<name>` layout, which is
+                # not necessarily where the owner is actually registered — do not
+                # suggest a command that may itself be broken.
+                echo "Brief belongs to project '$BRIEF_OWNER' but its registered path could not be resolved."
+                echo "Check ~/.skein/projects.json, or pass -d <path> to launch there directly."
                 exit 1
             fi
-        elif [ -z "$BRIEF_TITLE" ]; then
-            # -d was explicit but brief not found — use brief ID as session name
-            # BRIEF_ID is raw user input here; it must never become a session name as-is.
-            SESSION="shuttle-$(safe_session_name "$BRIEF_ID")"
-        else
-            SESSION="shuttle-$(safe_session_name "$BRIEF_TITLE")"
         fi
+
+        # -d explicit tolerates a brief SKEIN doesn't know about: the user pinned a
+        # directory, so fall through and launch there with the raw id as the title.
+        if [ -z "$BRIEF_FOUND" ] && [ -z "$EXPLICIT_DIR" ]; then
+            echo "Brief not found: $BRIEF_ID"
+            echo "Not found in current project or any registered SKEIN project."
+            if [ -n "$BRIEF_OUTPUT" ]; then
+                echo "$BRIEF_OUTPUT"
+            fi
+            exit 1
+        fi
+
+        # BRIEF_ID is raw user input; it must never become a session name as-is.
+        SESSION="shuttle-$(safe_session_name "${BRIEF_TITLE:-$BRIEF_ID}")"
 
         if [ "$AGENT" = "codex" ]; then
             SESSION="shuttle-codex-${SESSION#shuttle-}"
@@ -2085,36 +2094,45 @@ $CONTENT
             else
                 BRIEF_CHECK=$(skein folio "$BRIEF_ID" 2>&1) || true
             fi
-            if echo "$BRIEF_CHECK" | grep -q "^folio $BRIEF_ID"; then
+            BRIEF_OWNER=""
+            # See 'go' for why the bare lookup's own "[owner]" tag is used, and why
+            # that must run whenever the tag is present — not only when the lookup
+            # failed, since a bare lookup succeeds globally regardless of scope.
+            RENDER_LINE=$(echo "$BRIEF_CHECK" | grep "^folio $BRIEF_ID" | head -1)
+            if [ -n "$RENDER_LINE" ]; then
                 BRIEF_FOUND=1
-            else
-                FOUND_PROJECT=""
-                FOUND_PROJECT_DIR=""
-                # See 'go': `--all --json`'s embedded site_id is the real owner;
-                # the plain-text `--all` output's "[project]" tag is not trustworthy.
-                GLOBAL_OUTPUT=$(skein folio --all "$BRIEF_ID" --json 2>/dev/null) || true
-                if [ -n "$GLOBAL_OUTPUT" ]; then
-                    FOUND_PROJECT=$(echo "$GLOBAL_OUTPUT" | jq -r '.results[0].site_id // empty' 2>/dev/null) || true
+                case "$RENDER_LINE" in
+                    "folio $BRIEF_ID ["*"]")
+                        BRIEF_OWNER="${RENDER_LINE#folio $BRIEF_ID [}"
+                        BRIEF_OWNER="${BRIEF_OWNER%]}"
+                        ;;
+                esac
+            fi
+
+            if [ -n "$BRIEF_OWNER" ] && [ -z "$PROJECT_NAME" ]; then
+                OWNER_DIR=""
+                if [ -f ~/.skein/projects.json ]; then
+                    OWNER_DIR=$(jq -r ".projects[\"$BRIEF_OWNER\"].path // empty" ~/.skein/projects.json 2>/dev/null) || true
                 fi
-                if [ -n "$FOUND_PROJECT" ] && [ -f ~/.skein/projects.json ]; then
-                    FOUND_PROJECT_DIR=$(jq -r ".projects[\"$FOUND_PROJECT\"].path // empty" ~/.skein/projects.json 2>/dev/null) || true
-                fi
-                if [ -n "$FOUND_PROJECT" ] && [ -n "$FOUND_PROJECT_DIR" ] && [ -d "$FOUND_PROJECT_DIR" ]; then
-                    echo "Brief found in: $FOUND_PROJECT ($FOUND_PROJECT_DIR)"
-                    PROJECT_DIR="$FOUND_PROJECT_DIR"
-                    BRIEF_FOUND=1
-                elif [ -n "$FOUND_PROJECT" ]; then
-                    echo "Brief belongs to project '$FOUND_PROJECT' but its path could not be resolved."
-                    echo "Use: shuttle $CMD -p $FOUND_PROJECT $BRIEF_ID"
-                    exit 1
+                if [ -n "$OWNER_DIR" ] && [ -d "$OWNER_DIR" ]; then
+                    echo "Brief found in: $BRIEF_OWNER ($OWNER_DIR)"
+                    PROJECT_DIR="$OWNER_DIR"
                 else
-                    echo "Brief not found: $BRIEF_ID"
-                    echo "Not found in current project or any registered SKEIN project."
-                    if [ -n "$BRIEF_CHECK" ]; then
-                        echo "$BRIEF_CHECK"
-                    fi
+                    # See 'go': don't suggest `-p $BRIEF_OWNER` — it assumes a
+                    # `~/projects/<name>` layout the owner may not actually use.
+                    echo "Brief belongs to project '$BRIEF_OWNER' but its registered path could not be resolved."
+                    echo "Check ~/.skein/projects.json, or pass -d <path> to launch there directly."
                     exit 1
                 fi
+            fi
+
+            if [ -z "$BRIEF_FOUND" ]; then
+                echo "Brief not found: $BRIEF_ID"
+                echo "Not found in current project or any registered SKEIN project."
+                if [ -n "$BRIEF_CHECK" ]; then
+                    echo "$BRIEF_CHECK"
+                fi
+                exit 1
             fi
         fi
 
