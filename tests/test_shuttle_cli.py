@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from stat import S_IMODE
 
@@ -28,12 +29,89 @@ def cli_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
     tmux_log = tmp_path / "tmux.log"
     _executable(
         bin_dir / "tmux",
+        # Models tmux 3.0a target semantics, measured against the real binary:
+        #   - session targets resolve exact name FIRST, then fall back to PREFIX match
+        #   - has-session / kill-session HONOUR the '=' exact-match prefix
+        #   - pane targets (send-keys, capture-pane, display-message) REJECT '=name'
+        #   - list-panes IGNORES '=' and still prefix-matches (a real 3.0a quirk)
+        # The prefix fallback is the point: a fake that merely refuses an inexact
+        # target cannot catch code that lets tmux silently guess the wrong session.
         """import json, os, sys
 args = sys.argv[1:]
 with open(os.environ['TMUX_LOG'], 'a') as stream:
     stream.write(json.dumps(args) + '\\n')
-sessions = [line.split('|') for line in os.environ.get('TMUX_SESSIONS', '').splitlines() if line]
+
+state = os.environ['TMUX_LOG'] + '.sessions'
+# TMUX_SESSIONS is a convenient '|'-delimited table, which by construction cannot
+# express a session name containing '|', a newline, a backslash or the 0x1f
+# separator — all of which tmux accepts. TMUX_SESSIONS_JSON exists so those names
+# ARE expressible: without it, a parser that splits on '|' can never be tested
+# against the name that breaks it, and the fake inherits the bug it should catch.
+if os.environ.get('TMUX_SESSIONS_JSON'):
+    sessions = [list(row) for row in json.loads(os.environ['TMUX_SESSIONS_JSON'])]
+else:
+    sessions = [line.split('|') for line in os.environ.get('TMUX_SESSIONS', '').splitlines() if line]
+if os.path.exists(state):
+    for line in open(state).read().splitlines():
+        if line and not any(row[0] == line.split('|')[0] for row in sessions):
+            sessions.append(line.split('|'))
 panes = [line.split('|') for line in os.environ.get('TMUX_PANES', '').splitlines() if line]
+pstate = os.environ['TMUX_LOG'] + '.panes'
+if os.path.exists(pstate):
+    for line in open(pstate).read().splitlines():
+        if line:
+            panes.append(line.split('|'))
+
+def find_session(target, exact_only):
+    # tmux resolution order for a session target: exact name, then start-of-name.
+    for row in sessions:
+        if row[0] == target:
+            return row[0]
+    if exact_only:
+        return None
+    for row in sessions:
+        if row[0].startswith(target):
+            return row[0]
+    return None
+
+def pane_of(name):
+    for index, row in enumerate(sessions):
+        if row[0] == name:
+            return '%' + str(index + 1)
+    return None
+
+def session_of(pane):
+    for row in panes:
+        if row[0] == pane:
+            return row[1] if len(row) > 1 else None
+    for index, row in enumerate(sessions):
+        if '%' + str(index + 1) == pane:
+            return row[0]
+    return None
+
+def pane_target(target):
+    if target.startswith('='):
+        sys.stderr.write("can't find pane: " + target + '\\n')
+        raise SystemExit(1)
+    if target == '':
+        # Real tmux NEVER fails on an empty -t: it binds the current session (or the
+        # most recently used one). Modelling that forgiveness is the whole point — a
+        # fake that merely refused could not catch code that leaks an empty target,
+        # which is how a command ends up reading the CALLER's session instead.
+        current = os.environ.get('TMUX_CURRENT_SESSION', '')
+        resolved = pane_of(current) if current else None
+    elif target.startswith('%'):
+        resolved = target if session_of(target) is not None else None
+    else:
+        # A bare session name on a pane target resolves to that session's active
+        # pane — and slides to a PREFIX match if the exact name is gone.
+        name = find_session(target, exact_only=False)
+        resolved = pane_of(name) if name else None
+    if resolved is None:
+        sys.stderr.write("can't find pane: " + target + '\\n')
+        raise SystemExit(1)
+    return resolved
+
 cmd = args[0] if args else ''
 if cmd in ('list-sessions', 'ls'):
     if not sessions:
@@ -41,31 +119,89 @@ if cmd in ('list-sessions', 'ls'):
     fmt = args[args.index('-F') + 1] if '-F' in args else ''
     for fields in sessions:
         name = fields[0]; attached = fields[1] if len(fields) > 1 else '0'; activity = fields[2] if len(fields) > 2 else '1'
-        if 'session_attached' in fmt and 'session_activity' in fmt: print(f'{name}|{attached}|{activity}')
-        elif 'session_activity' in fmt: print(f'{name}|{activity}')
-        else: print(name)
+        if not fmt:
+            print(name)
+            continue
+        # Honour the caller's real format string, separator and all — otherwise a
+        # lookup that splits on 0x1f can't be tested at all.
+        print(fmt.replace('#{session_name}', name)
+                 .replace('#{session_attached}', attached)
+                 .replace('#{session_activity}', activity))
 elif cmd == 'has-session':
-    target = args[args.index('-t') + 1].lstrip('=')
-    raise SystemExit(0 if any(row[0] == target for row in sessions) else 1)
-elif cmd == 'display-message':
-    target = args[args.index('-t') + 1].lstrip('=')
-    fmt = args[-1] if args else ''
-    if fmt == '#{session_name}':
-        pane = next((row for row in panes if row[0] == target), None)
-        if pane and len(pane) > 1:
-            print(pane[1])
-            raise SystemExit(0)
-        row = next((row for row in sessions if row[0] == target), None)
-        if row:
-            print(row[0])
-            raise SystemExit(0)
+    target = args[args.index('-t') + 1]
+    # Honours '=' : exact only. Without it, a prefix match counts.
+    found = find_session(target[1:], True) if target.startswith('=') else find_session(target, False)
+    raise SystemExit(0 if found else 1)
+elif cmd == 'kill-session':
+    target = args[args.index('-t') + 1]
+    found = find_session(target[1:], True) if target.startswith('=') else find_session(target, False)
+    if not found:
+        sys.stderr.write("can't find session: " + target + '\\n')
         raise SystemExit(1)
-    row = next((row for row in sessions if row[0] == target), None)
-    print(row[1] if row and len(row) > 1 else '0')
+elif cmd == 'list-panes':
+    target = args[args.index('-t') + 1]
+    # tmux 3.0a IGNORES '=' here and still prefix-matches. Reproducing that is the
+    # whole point: it is why session_pane() must verify #{session_name} itself
+    # rather than trusting '=' to have enforced exactness.
+    name = find_session(target.lstrip('='), exact_only=False)
+    # TMUX_PANELESS models a session that vanished between resolve and use: it is
+    # still listed, but has no pane to bind. This is the state every empty-'-t'
+    # guard exists to handle.
+    if name in os.environ.get('TMUX_PANELESS', '').split(','):
+        raise SystemExit(0)
+    pane = pane_of(name) if name else None
+    if pane is None:
+        sys.stderr.write("can't find session: " + target + '\\n')
+        raise SystemExit(1)
+    fmt = args[args.index('-F') + 1] if '-F' in args else ''
+    fmt = fmt.replace('#{session_name}', name)
+    def emit(window_active, pane_active, pane_id):
+        print(fmt.replace('#{window_active}', window_active)
+                 .replace('#{pane_active}', pane_active)
+                 .replace('#{pane_id}', pane_id))
+    # A multi-window, multi-pane session: only ONE row is the active pane of the
+    # active window. The decoys come first, so any code that takes the first row
+    # (or drops the '11' filter) picks a pane that belongs to no session.
+    emit('0', '1', pane + '90')   # another window's active pane
+    emit('1', '0', pane + '91')   # active window, inactive pane
+    emit('1', '1', pane)          # the one we want
+elif cmd == 'display-message':
+    pane = pane_target(args[args.index('-t') + 1])
+    fmt = args[-1] if args else ''
+    name = session_of(pane)
+    if fmt == '#{session_name}':
+        print(name)
+    elif fmt == '#{pane_current_path}':
+        print(os.environ.get('TMUX_PANE_PATH', os.getcwd()))
+    else:
+        row = next((row for row in sessions if row[0] == name), None)
+        print(row[1] if row and len(row) > 1 else '0')
 elif cmd == 'capture-pane':
-    print('> ')
+    pane_target(args[args.index('-t') + 1])
+    # Default '> ' reads as "at the prompt". Override it to make detect_session_state
+    # fall through its content checks to the IDLE-time branch, which is the only way
+    # to observe whether the activity lookup actually found the session.
+    print(os.environ.get('TMUX_PANE_CONTENT', '> '))
+elif cmd == 'send-keys':
+    pane_target(args[args.index('-t') + 1])
+elif cmd == 'split-window':
+    # Allocate a fresh pane id and remember it belongs to a live pane, so a later
+    # send-keys/capture-pane targeting it resolves. Print only the id, as `-P -F`.
+    existing = [row for row in panes if row[0].startswith('%split')]
+    pane = '%split' + str(len(existing) + 1)
+    with open(pstate, 'a') as stream:
+        stream.write(pane + '|split-window-session\\n')
+    print(pane)
 elif cmd == 'new-session':
-    raise SystemExit(int(os.environ.get('TMUX_NEW_SESSION_RC', '0')))
+    rc = int(os.environ.get('TMUX_NEW_SESSION_RC', '0'))
+    # TMUX_NEW_SESSION_DIES models the real hazard: tmux creates the session and
+    # returns 0, then the supervised command dies on startup and tmux tears the
+    # session down again. The session never becomes visible to later calls.
+    register = rc == 0 and not os.environ.get('TMUX_NEW_SESSION_DIES')
+    if register and '-s' in args:
+        with open(state, 'a') as stream:
+            stream.write(args[args.index('-s') + 1] + '|0|1\\n')
+    raise SystemExit(rc)
 """,
     )
     _executable(
@@ -323,6 +459,331 @@ def test_go_provider_default_and_codex_initial_prompt(cli_env, tmp_path: Path) -
     assert b"degraded mode" in codex.stderr
 
 
+def test_go_accepts_a_brief_whose_first_heading_is_a_subheading(
+    cli_env, tmp_path: Path
+) -> None:
+    # A '## Heading' body used to leave one '#', which scrubbed down to a leading
+    # dash: the registry then saw "--title -whats-ready" and argparse read the
+    # value as a flag, killing the launch under `set -e`.
+    env, _ = cli_env
+    bin_dir = Path(env["PATH"].split(":", 1)[0])
+    _executable(
+        bin_dir / "skein",
+        "import sys\n"
+        "if len(sys.argv) > 2 and sys.argv[1] == 'folio':\n"
+        "    print('folio ' + sys.argv[2])\n"
+        '    print("    ## Whats Ready")\n',
+    )
+
+    result = run_cli(env, "go", "-d", str(tmp_path), "brief-9")
+
+    assert result.returncode == 0, result.stderr.decode()
+    launch = Registry(env["SHUTTLE_HOME"]).list_launches()[-1]
+    assert launch["title"] == "whats-ready"
+    assert launch["tmux_session"] == "shuttle-whats-ready"
+
+
+def test_dead_session_never_hands_off_to_a_prefix_neighbour(cli_env, tmp_path: Path) -> None:
+    # The nastiest failure mode. `go` creates shuttle-provider-test, the supervised
+    # command dies instantly, and a live session shares that name as a prefix.
+    # tmux 3.0a's list-panes IGNORES the '=' exact prefix and slides to the
+    # neighbour, so a session_pane() that trusted '=' would deliver the HANDOFF —
+    # the user's brief — into somebody else's session.
+    env, log = cli_env
+    env["TMUX_SESSIONS"] = "shuttle-provider-test-neighbour|0|1"
+    env["TMUX_NEW_SESSION_DIES"] = "1"
+
+    result = run_cli(env, "go", "-d", str(tmp_path), "brief-1")
+
+    assert result.returncode != 0, "go must fail loudly when its session died"
+    sends = [call for call in tmux_calls(log) if call[0] == "send-keys"]
+    assert sends == [], f"HANDOFF leaked into another session: {sends}"
+    # And it must not read the neighbour's screen and announce a confident "Ready!"
+    # for a session that is already dead. An honest timeout beats a lying signal.
+    assert b"Ready!" not in result.stdout, result.stdout.decode()
+
+
+@pytest.mark.parametrize("command", ["tail", "context"])
+def test_tail_and_context_refuse_ambiguous_targets(cli_env, command: str) -> None:
+    # Both used to pick a session with `tmux ls | grep "$TARGET" | head -1` — a
+    # substring's FIRST hit, with no ambiguity check. They now go through the same
+    # resolve_session funnel as peek/send/relay: exact wins, a partial must name
+    # exactly one session, and ambiguity is an error rather than a silent guess.
+    env, _ = cli_env
+    env["TMUX_SESSIONS"] = "shuttle-task-one|0|1\nshuttle-task-two|0|1"
+
+    result = run_cli(env, command, "shuttle-task", timeout=20)
+
+    assert result.returncode == 2, result.stdout.decode()
+    assert b"Ambiguous session target" in result.stderr
+
+
+def test_export_does_not_let_a_session_name_steal_a_partial_uuid(
+    cli_env, tmp_path: Path
+) -> None:
+    # export's branches are: numeric index, tmux session, then Claude UUID. Gating the
+    # session branch on resolve_session (SUBSTRING matching) let any live session whose
+    # name merely CONTAINED a uuid fragment swallow it, exporting the wrong transcript.
+    # tmux matches by PREFIX, which is what this branch has always meant.
+    env, _ = cli_env
+    env["TMUX_SESSIONS"] = "shuttle-deadbee-decoy|0|1"
+
+    history = Path(env["HOME"]) / ".claude" / "projects" / "-tmp-proj"
+    history.mkdir(parents=True)
+    transcript = history / "deadbee-1111-2222-3333.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "the real transcript"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    # A PARTIAL uuid — 'deadbee' is a substring of the decoy session's name, which is
+    # exactly how the decoy stole it. It is not a PREFIX of it, so tmux won't match.
+    result = run_cli(env, "export", "deadbee", timeout=30)
+
+    assert result.returncode == 0, result.stderr.decode()
+    assert b"the real transcript" in result.stdout, result.stdout.decode()
+
+
+def test_send_survives_a_suffix_colliding_session_name(cli_env) -> None:
+    # The activity lookup used `grep -F "$SESSION|"`, which matches any session whose
+    # name ENDS with the target (the '|' delimiter follows the name). With 'zzr3a' and
+    # 'xzzr3a' both live, two lines came back and `IDLE=$((NOW - ACTIVITY))` died with a
+    # raw bash syntax error. Deterministic, not a race: the target always matches itself.
+    env, log = cli_env
+    env["TMUX_SESSIONS"] = "xshuttle-send|0|1\nshuttle-send|0|1"
+
+    result = run_cli(env, "send", "--force", "shuttle-send", "probe")
+
+    assert result.returncode == 0, result.stderr.decode()
+    assert b"syntax error" not in result.stderr
+    literal = next(call for call in tmux_calls(log) if call[0] == "send-keys" and "-l" in call)
+    # '%2' is shuttle-send: the exact session, not its suffix-colliding neighbour.
+    assert literal[literal.index("-t") + 1] == "%2"
+
+
+@pytest.mark.parametrize("command", ["peek", "context", "tail"])
+def test_a_vanished_session_never_leaks_an_empty_tmux_target(
+    cli_env, command: str
+) -> None:
+    # The session resolves, then dies before its pane is bound. tmux NEVER fails on an
+    # empty `-t` — it binds the caller's own session — so any command that forwards an
+    # unchecked pane id silently reads or writes the WRONG session. Every such call site
+    # must refuse instead.
+    env, log = cli_env
+    env["TMUX_SESSIONS"] = "shuttle-gone|0|1\nshuttle-caller|0|1"
+    env["TMUX_PANELESS"] = "shuttle-gone"
+    env["TMUX_CURRENT_SESSION"] = "shuttle-caller"
+
+    result = run_cli(env, command, "shuttle-gone", timeout=20)
+
+    assert result.returncode != 0, result.stdout.decode()
+    empty_targets = [
+        call for call in tmux_calls(log)
+        if "-t" in call and call[call.index("-t") + 1] == ""
+    ]
+    assert empty_targets == [], f"leaked an empty -t: {empty_targets}"
+
+
+def test_a_session_named_like_a_pane_id_is_treated_as_a_session(cli_env) -> None:
+    # tmux accepts '%12' as a legal SESSION name. A "looks like a pane id" shortcut
+    # would send `shuttle send %12` into whichever session actually owns pane %12 —
+    # someone else's Claude prompt.
+    env, log = cli_env
+    # '%1' is the pane id the stub assigns to the FIRST session, so a session named
+    # '%1' is a decoy for the victim that really owns that pane.
+    env["TMUX_SESSIONS"] = "shuttle-victim|0|1\n%1|0|1"
+
+    result = run_cli(env, "send", "--force", "%1", "probe")
+
+    assert result.returncode == 0, result.stderr.decode()
+    literal = next(call for call in tmux_calls(log) if call[0] == "send-keys" and "-l" in call)
+    # '%2' is the session actually NAMED '%1'. Sending to '%1' would hit the victim.
+    assert literal[literal.index("-t") + 1] == "%2", "typed into the victim's pane"
+
+
+def test_resume_survives_a_dash_leading_stored_title(cli_env, tmp_path: Path) -> None:
+    # `go` slugs its title, but `resume` reads the title back from the REGISTRY, which
+    # stores it raw. A stored '-foo' passed as `--title -foo` is read by argparse as a
+    # flag, and the resume dies under `set -e`. The `--opt=value` form is what prevents it.
+    env, _ = cli_env
+    registry = Registry(env["SHUTTLE_HOME"])
+    old = registry.create_launch(
+        provider="codex",
+        mode="go",
+        cwd=str(tmp_path),
+        tmux_session="shuttle-codex-old",
+        pane_id="%9",
+        pid=os.getpid(),
+        title="-foo",
+        native_session_id="0199aaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    )
+    registry.close(old["launch_id"], status="exited", exit_code=0)
+
+    result = run_cli(env, "resume", "0199aaaa-bbbb-cccc-dddd-eeeeeeeeeeee", timeout=30)
+
+    assert b"expected one argument" not in result.stderr, result.stderr.decode()
+    assert result.returncode == 0, result.stderr.decode()
+
+
+def _skein_finds_nothing(env: dict[str, str]) -> None:
+    # Make `skein folio` print nothing, so `go`/`split` treat the brief as not found.
+    bin_dir = Path(env["PATH"].split(":", 1)[0])
+    _executable(bin_dir / "skein", "import sys\n")
+
+
+def test_go_sanitizes_a_raw_brief_id_into_the_session_name(cli_env, tmp_path: Path) -> None:
+    # With -d explicit and the brief not found, `go` builds the session name straight
+    # from the RAW brief id. tmux rejects '.'/':' and mis-parses '|'/newline/space, so
+    # the id must be scrubbed — and the --brief=value registry arg must still carry the
+    # raw id (a leading '-' would be read as a flag in the space-separated form).
+    env, _ = cli_env
+    _skein_finds_nothing(env)
+
+    result = run_cli(env, "go", "-d", str(tmp_path), "-weird.brief:id", timeout=30)
+
+    assert result.returncode == 0, result.stderr.decode()
+    launch = Registry(env["SHUTTLE_HOME"]).list_launches()[-1]
+    assert launch["tmux_session"] == "shuttle-weird-brief-id"
+    assert launch["brief"] == "-weird.brief:id", "raw brief id was not carried through"
+
+
+def test_go_never_collapses_two_briefs_onto_one_session(cli_env, tmp_path: Path) -> None:
+    # Two all-punctuation brief ids both scrub to empty. Without a non-empty fallback
+    # they collapse to the same 'shuttle-' name, so the second `go` reboards the FIRST
+    # brief's session instead of launching its own.
+    env, _ = cli_env
+    _skein_finds_nothing(env)
+
+    run_cli(env, "go", "-d", str(tmp_path), "!!!", timeout=30)
+    run_cli(env, "go", "-d", str(tmp_path), "@@@", timeout=30)
+
+    names = {r["tmux_session"] for r in Registry(env["SHUTTLE_HOME"]).list_launches()}
+    assert "shuttle-" not in names, "an empty session name leaked through"
+    assert len(names) == 2, f"two distinct briefs collapsed onto one session: {names}"
+
+
+def test_split_delivers_handoff_to_the_new_pane_by_id(cli_env, tmp_path: Path) -> None:
+    # split creates a pane and must hand the id straight to tmux_send_pane. Sending by
+    # session name instead (tmux_send_cmd) makes the HANDOFF undeliverable — tmux would
+    # look for a *session* named '%split1' and find none.
+    env, log = cli_env
+    env["TMUX"] = "/tmp/fake-tmux,1,0"
+
+    result = run_cli(env, "split", "-d", str(tmp_path), "brief-1", timeout=30)
+
+    assert result.returncode == 0, result.stderr.decode()
+    literal = next(
+        call for call in tmux_calls(log) if call[0] == "send-keys" and "-l" in call
+    )
+    target = literal[literal.index("-t") + 1]
+    assert target.startswith("%split"), f"HANDOFF not sent to the new pane: {target}"
+    assert literal[-2:] == ["--", "HANDOFF: brief-1"]
+
+
+def test_status_handles_a_pipe_in_a_session_name(cli_env) -> None:
+    # tmux permits '|' in a session name. Parsing list-sessions on '|' truncated NAME,
+    # so provider_for_session looked up the wrong session, the launch was printed a
+    # second time as a phantom stale row, and ATTACHED got a fragment of the name —
+    # which could abort a bare `shuttle` under `set -e` in the arithmetic below.
+    env, _ = cli_env
+    env["TMUX_SESSIONS_JSON"] = json.dumps([["shuttle-pipe|x", "0", "1"]])
+
+    result = run_cli(env, "status", timeout=30)
+
+    assert result.returncode == 0, result.stderr.decode()
+    assert b"integer expression expected" not in result.stderr
+    assert b"shuttle-pipe|x" in result.stdout, result.stdout.decode()
+
+
+def test_status_survives_the_separator_byte_inside_a_foreign_session_name(cli_env) -> None:
+    # Whatever separator status picks, tmux permits it in a session name. A foreign
+    # session whose name contains the 0x1f separator itself splits into junk fields, so
+    # ACTIVITY is non-numeric — the arithmetic guard must catch it rather than letting
+    # `$((NOW - junk))` abort a bare `shuttle` under `set -e`.
+    env, _ = cli_env
+    env["TMUX_SESSIONS_JSON"] = json.dumps([["zzr-usx", "0", "1"]])
+
+    result = run_cli(env, "status", timeout=30)
+
+    assert result.returncode == 0, result.stderr.decode()
+    # No arithmetic crash (ACTIVITY guard) and no `[: x: integer expression expected`
+    # noise from a non-numeric ATTACHED (ATTACHED guard).
+    assert b"syntax error" not in result.stderr
+    assert b"arithmetic" not in result.stderr
+    assert b"expected" not in result.stderr, result.stderr.decode()
+
+
+@pytest.mark.parametrize("name", ["shuttle-back\\x", "shuttle-sp ace"])
+def test_pane_lookup_survives_awkward_session_names(cli_env, name: str) -> None:
+    # `awk -v want=...` processes escape sequences, so a session named 'shuttle-back\x'
+    # arrived at awk mangled ('\x' is a hex escape in gawk) and never compared equal to
+    # itself — every pane-facing command (peek/send/relay/tail/status) funnels through
+    # session_pane, so the session became completely unreachable. ENVIRON does no such
+    # processing.
+    env, log = cli_env
+    env["TMUX_SESSIONS_JSON"] = json.dumps([[name, "0", "1"]])
+
+    result = run_cli(env, "peek", name, timeout=20)
+
+    assert result.returncode == 0, result.stderr.decode()
+    capture = next(call for call in tmux_calls(log) if call[0] == "capture-pane")
+    assert capture[capture.index("-t") + 1] == "%1"
+
+
+def test_idle_time_uses_an_exact_activity_lookup(cli_env) -> None:
+    # session_activity() must find the session by its EXACT name. `awk -v want=...`
+    # processes escape sequences, so a name containing a backslash never matched and the
+    # lookup returned nothing — idle then computed as NOW-0, i.e. decades, and the
+    # session was reported 'stuck' when it was merely quiet. ENVIRON does no escaping.
+    env, _ = cli_env
+    now = int(time.time())
+    env["TMUX_SESSIONS_JSON"] = json.dumps([["shuttle-back\\x", "0", str(now - 5)]])
+    env["TMUX_PANE_CONTENT"] = "nothing conclusive on this screen"
+
+    result = run_cli(env, "send", "shuttle-back\\x", "hi", timeout=20)
+
+    output = (result.stdout + result.stderr).decode()
+    assert result.returncode == 1, output
+    # Five seconds idle: 'unknown' state. A failed lookup would read as decades -> 'stuck'.
+    assert "unknown" in output, output
+    assert "stuck" not in output, output
+
+
+def test_ground_kills_only_exact_session_names(cli_env) -> None:
+    # A bare kill target prefix-matches. If a session exits between the listing and
+    # the kill, tmux would kill a NEIGHBOUR whose name starts with it.
+    env, log = cli_env
+    env["TMUX_SESSIONS"] = "shuttle-foo|0|1\nshuttle-foo-long|0|1"
+
+    result = run_cli(env, "ground")
+
+    assert result.returncode == 0, result.stderr.decode()
+    kills = [call for call in tmux_calls(log) if call[0] == "kill-session"]
+    assert kills, "ground killed nothing"
+    for call in kills:
+        target = call[call.index("-t") + 1]
+        assert target.startswith("="), f"inexact kill target: {target}"
+
+
+def test_pane_passthrough_only_accepts_real_pane_ids(cli_env) -> None:
+    # tmux permits a SESSION named '%foo'. Forwarding that as though it were a pane
+    # id would target nothing, and the command would exit 0 having captured nothing.
+    env, log = cli_env
+    env["TMUX_SESSIONS"] = "%weird-name|0|1"
+
+    result = run_cli(env, "peek", "%weird-name")
+
+    assert result.returncode == 0, result.stderr.decode()
+    capture = next(call for call in tmux_calls(log) if call[0] == "capture-pane")
+    assert capture[capture.index("-t") + 1] == "%1"
+
+
 def test_default_agent_environment_override(cli_env, tmp_path: Path) -> None:
     env, _ = cli_env
     env["SHUTTLE_DEFAULT_AGENT"] = "codex"
@@ -352,7 +813,12 @@ def test_exact_target_wins_and_ambiguous_partial_errors(cli_env) -> None:
     exact = run_cli(env, "peek", "task")
     assert exact.returncode == 0
     assert b"=== task" in exact.stdout
-    assert "=task" in next(call for call in tmux_calls(log) if call[0] == "capture-pane")
+    capture = next(call for call in tmux_calls(log) if call[0] == "capture-pane")
+    # The exact session 'task' must win over the partial matches, and it must be
+    # addressed by pane id — "=task" is not a legal pane target on tmux 3.0a.
+    listing = next(call for call in tmux_calls(log) if call[0] == "list-panes")
+    assert listing[listing.index("-t") + 1] == "=task"
+    assert capture[capture.index("-t") + 1] == "%1"
 
     ambiguous = run_cli(env, "peek", "shuttle-task")
     assert ambiguous.returncode == 2
@@ -373,9 +839,9 @@ def test_numeric_targets_must_be_positive_before_indexing(cli_env, target: str) 
 
 @pytest.mark.parametrize(
     ("command", "tmux_command"),
-    [("board", "attach"), ("peek", "capture-pane"), ("kill", "kill-session")],
+    [("board", "attach"), ("kill", "kill-session")],
 )
-def test_target_commands_use_resolved_exact_tmux_name(
+def test_session_target_commands_use_exact_name(
     cli_env, command: str, tmux_command: str
 ) -> None:
     env, log = cli_env
@@ -384,6 +850,26 @@ def test_target_commands_use_resolved_exact_tmux_name(
     assert result.returncode == 0, result.stderr.decode()
     call = next(call for call in tmux_calls(log) if call[0] == tmux_command)
     assert call[call.index("-t") + 1] == "=shuttle-unique-name"
+
+
+@pytest.mark.parametrize(
+    ("argv", "tmux_command"),
+    [
+        (("peek", "unique"), "capture-pane"),
+        (("send", "--force", "unique", "hello"), "send-keys"),
+    ],
+)
+def test_pane_target_commands_use_a_pane_id_never_an_equals_name(
+    cli_env, argv: tuple[str, ...], tmux_command: str
+) -> None:
+    # tmux 3.0a rejects "=name" on pane targets, so these must resolve to a pane id.
+    env, log = cli_env
+    env["TMUX_SESSIONS"] = "shuttle-unique-name|0|1"
+    result = run_cli(env, *argv)
+    assert result.returncode == 0, result.stderr.decode()
+    call = next(call for call in tmux_calls(log) if call[0] == tmux_command)
+    target = call[call.index("-t") + 1]
+    assert target.startswith("%"), target
 
 
 def test_board_gui_uses_argv_terminal_and_exact_attach_target(
@@ -584,7 +1070,7 @@ def test_relay_is_claude_only_and_keeps_claude_send_path(
     sent = run_cli(env, "relay", "shuttle-claude", str(payload))
     assert sent.returncode == 0, sent.stderr.decode()
     literal = next(call for call in tmux_calls(log) if "-l" in call)
-    assert literal[literal.index("-t") + 1] == "=shuttle-claude"
+    assert literal[literal.index("-t") + 1].startswith("%")
     assert literal[-2:] == ["--", "hello from relay"]
 
 
