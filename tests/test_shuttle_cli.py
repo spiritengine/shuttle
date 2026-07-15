@@ -694,6 +694,35 @@ def _skein_global_match_fixture(env: dict[str, str], real_project: str, decoy_pr
     )
 
 
+def _skein_unscoped_cwd_fixture(env: dict[str, str], real_project: str) -> None:
+    # Models skein when the invoking cwd has no resolvable SKEIN scope at all
+    # (/tmp, $HOME, a bare ~/projects with no .skein): the AMBIENT bare lookup
+    # (no SKEIN_PROJECT set) errors "No project specified" with EMPTY stdout,
+    # before the global-owner cascade in _skein_global_match_fixture ever gets
+    # a chance to run. Once given an EXPLICIT SKEIN_PROJECT (any registered
+    # project acting as a probe scope), the cascade runs exactly like that
+    # fixture and finds the real owner.
+    bin_dir = Path(env["PATH"].split(":", 1)[0])
+    _executable(
+        bin_dir / "skein",
+        "import os, sys\n"
+        "argv = sys.argv[1:]\n"
+        "if len(argv) >= 2 and argv[0] == 'folio':\n"
+        "    rest = argv[1:]\n"
+        "    folio_id = next(a for a in rest if not a.startswith('--'))\n"
+        "    scope = os.environ.get('SKEIN_PROJECT')\n"
+        "    if not scope:\n"
+        "        sys.stderr.write('No project specified\\n')\n"
+        "        sys.exit(1)\n"
+        f"    if scope == {real_project!r}:\n"
+        "        print('folio ' + folio_id)\n"
+        "    else:\n"
+        f"        print('folio ' + folio_id + ' [{real_project}]')\n"
+        "    print('    # Cross Project Brief')\n"
+        "    sys.exit(0)\n",
+    )
+
+
 def _register_projects(tmp_path: Path, env: dict[str, str], real_project: str, decoy_project: str) -> tuple[Path, Path]:
     # decoy_project sorts before real_project, so any leftover "first hit wins"
     # logic — over `--all`'s results, or a per-project scan — would land on the
@@ -781,6 +810,90 @@ def test_split_resolves_cross_project_brief_to_its_real_owner_not_first_alphabet
     assert result.returncode == 0, result.stderr.decode()
     split_call = next(call for call in tmux_calls(log) if call[0] == "split-window")
     assert split_call[split_call.index("-c") + 1] == str(real_dir), split_call
+
+
+def test_go_resolves_cross_project_brief_from_an_unscoped_cwd(
+    cli_env, tmp_path: Path
+) -> None:
+    # /tmp, $HOME, a bare ~/projects with no .skein: the ambient bare lookup
+    # (no SKEIN_PROJECT, no .skein dir to walk up to) errors "No project
+    # specified" with EMPTY stdout before the owner cascade ever runs. A fix
+    # that only retries the SAME ambient scope, or gives up the moment the
+    # first lookup errors, reports a false "brief not found" for a brief that
+    # genuinely exists — resolution must fall back to an explicit,
+    # guaranteed-registered scope instead of depending on the invoking cwd.
+    env, _ = cli_env
+    env.pop("SKEIN_PROJECT", None)
+    _skein_unscoped_cwd_fixture(env, real_project="zzz-project")
+    home = Path(env["HOME"])
+    skein_dir = home / ".skein"
+    skein_dir.mkdir(parents=True)
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    write_json(
+        skein_dir / "projects.json",
+        {
+            "projects": {
+                "shuttle": {"path": str(tmp_path / "shuttle-probe-scope")},
+                "zzz-project": {"path": str(real_dir)},
+            }
+        },
+    )
+
+    result = run_cli(env, "go", "brief-cross", timeout=30)
+
+    assert result.returncode == 0, result.stderr.decode()
+    launch = Registry(env["SHUTTLE_HOME"]).list_launches()[-1]
+    assert launch["cwd"] == str(real_dir), launch
+
+
+def test_split_resolves_cross_project_brief_from_an_unscoped_cwd(
+    cli_env, tmp_path: Path
+) -> None:
+    env, log = cli_env
+    env["TMUX"] = "/tmp/fake-tmux,1,0"
+    env.pop("SKEIN_PROJECT", None)
+    _skein_unscoped_cwd_fixture(env, real_project="zzz-project")
+    home = Path(env["HOME"])
+    skein_dir = home / ".skein"
+    skein_dir.mkdir(parents=True)
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    write_json(
+        skein_dir / "projects.json",
+        {
+            "projects": {
+                "shuttle": {"path": str(tmp_path / "shuttle-probe-scope")},
+                "zzz-project": {"path": str(real_dir)},
+            }
+        },
+    )
+
+    result = run_cli(env, "split", "brief-cross", timeout=30)
+
+    assert result.returncode == 0, result.stderr.decode()
+    split_call = next(call for call in tmux_calls(log) if call[0] == "split-window")
+    assert split_call[split_call.index("-c") + 1] == str(real_dir), split_call
+
+
+def test_go_with_explicit_project_flag_keeps_its_own_directory_despite_owner_tag(
+    cli_env,
+) -> None:
+    # Round-2 fell flagged this path as untested: an explicit -p must pin the
+    # directory even when the bare lookup's global cascade reports the brief
+    # is actually owned by a DIFFERENT project. -p is a deliberate user
+    # override, not a hint to relocate.
+    env, _ = cli_env
+    _skein_global_match_fixture(env, real_project="zzz-project", decoy_project="aaa-project")
+    home = Path(env["HOME"])
+    pinned_dir = home / "projects" / "aaa-project"
+    pinned_dir.mkdir(parents=True)
+
+    result = run_cli(env, "go", "-p", "aaa-project", "brief-cross", timeout=30)
+
+    assert result.returncode == 0, result.stderr.decode()
+    launch = Registry(env["SHUTTLE_HOME"]).list_launches()[-1]
+    assert launch["cwd"] == str(pinned_dir), launch
 
 
 def test_go_sanitizes_a_raw_brief_id_into_the_session_name(cli_env, tmp_path: Path) -> None:
